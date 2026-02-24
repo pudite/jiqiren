@@ -4,6 +4,9 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <FluxGarage_RoboEyes.h>
+#include <Adafruit_VL53L0X.h>
+Adafruit_VL53L0X lox = Adafruit_VL53L0X();
+bool sensorOK = false;            // 传感器状态
 
 /* =================代码原作者为Huy Vector================= */
 /* ================= 千秋我不见 仅转译优化================= */
@@ -1019,7 +1022,17 @@ void setupServer() {
   server.onNotFound(handleRoot);
   server.begin();
 }
-
+// 将 getDistance 函数移到全局作用域
+uint16_t getDistance() {
+  if (!sensorOK) return 2000; // 传感器不可用返回安全值
+  VL53L0X_RangingMeasurementData_t measure;
+  lox.rangingTest(&measure, false); // false 表示不打印调试信息
+  if (measure.RangeStatus != 4) {   // 4 表示无效数据
+    return measure.RangeMilliMeter;
+  } else {
+    return 2000; // 无效数据返回远距离
+  }
+}
 /* ================= 初始化设置 ================= */
 void setup() {
   // 增加启动延迟
@@ -1090,8 +1103,20 @@ void setup() {
   
   // 初始化ASR Pro2串口
   ASRSerial.begin(ASR_BAUDRATE, SERIAL_8N1, ASR_RX_PIN, ASR_TX_PIN);
+  // ================= 初始化VL53L0X传感器 =================
+  if (!lox.begin()) {
+    Serial.println("VL53L0X 初始化失败！");
+    sensorOK = false;
+  } else {
+    Serial.println("VL53L0X 初始化成功");
+    sensorOK = true;
+    // 读取一次距离测试
+    uint16_t dist = getDistance();
+    Serial.print("首次距离读取: ");
+    Serial.print(dist);
+    Serial.println(" mm");
+  }
   Serial.println("ASR Pro2 串口初始化完成，等待语音指令...");
-
   // 使能电机驱动
   digitalWrite(STBY, HIGH);
 
@@ -1167,5 +1192,13 @@ void loop() {
       display.println("控制中...");
       display.display();
     }
+  }
+  // 每2秒读取一次距离用于测试
+  static unsigned long lastTestRead = 0;
+  if (sensorOK && millis() - lastTestRead > 2000) {
+    lastTestRead = millis();
+    uint16_t d = getDistance();
+    Serial.print("测试距离: ");
+    Serial.println(d);
   }
 }
