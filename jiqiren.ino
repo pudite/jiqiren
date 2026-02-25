@@ -9,33 +9,61 @@ Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 bool sensorOK = false;            // 传感器状态
 uint16_t baseDistance = 0;   // 基准距离
 uint16_t edgeThreshold = 0;   // 防跌落阈值
-// 获取滤波后的距离（5次采样去极值平均）
-uint16_t getFilteredDistance() {
+bool movingForward = false;               // 是否正在前进
+
+// 防跌落动作状态机
+enum FallState { FALL_IDLE, FALL_STOP, FALL_BACKWARD, FALL_DONE };
+FallState fallState = FALL_IDLE;
+unsigned long fallActionTime = 0;
+
+// 滤波状态机变量（替代原来的 getFilteredDistance）
+enum FilterState { FILTER_IDLE, FILTER_SAMPLING };
+FilterState filterState = FILTER_IDLE;
+int filterIndex = 0;
+uint16_t filterValues[5];
+unsigned long lastFilterTime = 0;
+uint16_t latestDistance = 0;  // 最新滤波后的距离
+// 非阻塞滤波，需要在 loop 中频繁调用，有新数据时更新 latestDistance
+void updateFilter() {
   const int samples = 5;
-  uint16_t values[samples];
   
-  for (int i = 0; i < samples; i++) {
-    values[i] = getDistance(); // 使用已定义的getDistance()，之后可能修改为 getRawDistance()
-    delay(10); // 短暂延时，但这里会阻塞，后面会改为非阻塞
+  if (filterState == FILTER_IDLE) {
+    filterIndex = 0;
+    filterState = FILTER_SAMPLING;
+    lastFilterTime = millis();
+    // 立即采第一个点
+    filterValues[0] = getDistance();
+    filterIndex = 1;
+    return;
   }
   
-  // 排序
-  for (int i = 0; i < samples-1; i++) {
-    for (int j = i+1; j < samples; j++) {
-      if (values[i] > values[j]) {
-        uint16_t temp = values[i];
-        values[i] = values[j];
-        values[j] = temp;
+  if (filterState == FILTER_SAMPLING) {
+    if (millis() - lastFilterTime >= 10) { // 每10ms采样一次
+      if (filterIndex < samples) {
+        filterValues[filterIndex] = getDistance();
+        filterIndex++;
+        lastFilterTime = millis();
+      }
+      if (filterIndex >= samples) {
+        // 采样完成，排序去极值平均
+        for (int i = 0; i < samples-1; i++) {
+          for (int j = i+1; j < samples; j++) {
+            if (filterValues[i] > filterValues[j]) {
+              uint16_t temp = filterValues[i];
+              filterValues[i] = filterValues[j];
+              filterValues[j] = temp;
+            }
+          }
+        }
+        uint32_t sum = 0;
+        for (int i = 1; i < samples-1; i++) {
+          sum += filterValues[i];
+        }
+        latestDistance = sum / (samples - 2);
+        filterState = FILTER_IDLE;
       }
     }
   }
-  
-  // 去掉最小和最大，取中间三个的平均
-  uint32_t sum = 0;
-  for (int i = 1; i < samples-1; i++) {
-    sum += values[i];
-  }
-  return sum / (samples - 2);
 }
 
 /* =================代码原作者为Huy Vector================= */
@@ -107,27 +135,32 @@ volatile RandomMode randomMode = RANDOM_NORMAL;  // 当前随机模式
 
 /* ================= WiFi控制电机函数 ================= */
 void motorWifi(byte c) {
-  digitalWrite(STBY, HIGH);  // 使能电机驱动
+  digitalWrite(STBY, HIGH);
   switch (c) {
-    case 0:  // 停止
+    case 0:
       digitalWrite(LF, LOW); digitalWrite(LB, LOW);
       digitalWrite(RF, LOW); digitalWrite(RB, LOW);
+      movingForward = false;
       break;
-    case 1:  // 前进
+    case 1:
       digitalWrite(LF, HIGH); digitalWrite(LB, LOW);
       digitalWrite(RF, LOW);  digitalWrite(RB, HIGH);
+      movingForward = true;
       break;
-    case 2:  // 后退
+    case 2:
       digitalWrite(LF, LOW);  digitalWrite(LB, HIGH);
       digitalWrite(RF, HIGH); digitalWrite(RB, LOW);
+      movingForward = false;
       break;
-    case 3:  // 左转
+    case 3:
       digitalWrite(LF, LOW);  digitalWrite(LB, HIGH);
       digitalWrite(RF, LOW);  digitalWrite(RB, HIGH);
+      movingForward = false;
       break;
-    case 4:  // 右转
+    case 4:
       digitalWrite(LF, HIGH); digitalWrite(LB, LOW);
       digitalWrite(RF, HIGH); digitalWrite(RB, LOW);
+      movingForward = false;
       break;
   }
 }
@@ -1204,6 +1237,40 @@ void loop() {
   
   // 检查并执行语音动作
   checkVoiceAction();
+  
+  // ========== 新增：防跌落逻辑 ==========
+  // 1. 非阻塞更新滤波距离
+  updateFilter();
+
+  // 2. 防跌落触发判断（使用最新距离）
+  if (fallState == FALL_IDLE && movingForward && latestDistance > edgeThreshold) {
+    Serial.println("防跌落触发！");
+    fallState = FALL_STOP;
+    motorWifi(0);
+    fallActionTime = millis();
+  }
+
+  // 3. 防跌落动作状态机
+  switch (fallState) {
+    case FALL_STOP:
+      if (millis() - fallActionTime >= 100) {
+        motorWifi(2); // 后退
+        fallActionTime = millis();
+        fallState = FALL_BACKWARD;
+      }
+      break;
+    case FALL_BACKWARD:
+      if (millis() - fallActionTime >= 400) {
+        motorWifi(0); // 停止
+        fallState = FALL_DONE;
+      }
+      break;
+    case FALL_DONE:
+      fallState = FALL_IDLE;
+      break;
+    default:
+      break;
+  }
 
   // 随机模式控制 - 仅在非手动控制且非语音动作时执行
   static unsigned long lastTick = 0;
