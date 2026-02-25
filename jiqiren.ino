@@ -7,6 +7,36 @@
 #include <Adafruit_VL53L0X.h>
 Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 bool sensorOK = false;            // 传感器状态
+uint16_t baseDistance = 0;   // 基准距离
+uint16_t edgeThreshold = 0;   // 防跌落阈值
+// 获取滤波后的距离（5次采样去极值平均）
+uint16_t getFilteredDistance() {
+  const int samples = 5;
+  uint16_t values[samples];
+  
+  for (int i = 0; i < samples; i++) {
+    values[i] = getDistance(); // 使用已定义的getDistance()，之后可能修改为 getRawDistance()
+    delay(10); // 短暂延时，但这里会阻塞，后面会改为非阻塞
+  }
+  
+  // 排序
+  for (int i = 0; i < samples-1; i++) {
+    for (int j = i+1; j < samples; j++) {
+      if (values[i] > values[j]) {
+        uint16_t temp = values[i];
+        values[i] = values[j];
+        values[j] = temp;
+      }
+    }
+  }
+  
+  // 去掉最小和最大，取中间三个的平均
+  uint32_t sum = 0;
+  for (int i = 1; i < samples-1; i++) {
+    sum += values[i];
+  }
+  return sum / (samples - 2);
+}
 
 /* =================代码原作者为Huy Vector================= */
 /* ================= 千秋我不见 仅转译优化================= */
@@ -1110,6 +1140,26 @@ void setup() {
   } else {
     Serial.println("VL53L0X 初始化成功");
     sensorOK = true;
+        // 动态校准：连续读取10次距离取平均
+    uint32_t sumDist = 0;
+    for (int i = 0; i < 10; i++) {
+      sumDist += getDistance();  // 原来是 getRawDistance()
+      delay(50);
+    }
+    baseDistance = sumDist / 10;
+    edgeThreshold = baseDistance + 30; // 防跌落阈值 = 基准 + 30mm
+
+    Serial.print("基准距离: "); Serial.print(baseDistance); Serial.println(" mm");
+    Serial.print("防跌落阈值: "); Serial.print(edgeThreshold); Serial.println(" mm");
+
+    // 在OLED上显示校准结果（2秒）
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Calibration OK");
+    display.print("Base: "); display.print(baseDistance); display.println("mm");
+    display.display();
+    delay(2000);
     // 读取一次距离测试
     uint16_t dist = getDistance();
     Serial.print("首次距离读取: ");
