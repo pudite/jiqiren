@@ -12,7 +12,18 @@ uint16_t edgeThreshold = 0;   // 防跌落阈值
 bool movingForward = false;               // 是否正在前进
 
 // 防跌落动作状态机
-enum FallState { FALL_IDLE, FALL_STOP, FALL_BACKWARD, FALL_DONE };
+// 防跌落动作模式：0=手动模式（仅后退停止），1=好奇模式（后退+转向）
+uint8_t fallMode = 0;
+// 新增状态
+enum FallState { 
+  FALL_IDLE, 
+  FALL_STOP, 
+  FALL_BACKWARD, 
+  FALL_TURN,      // 转向准备
+  FALL_TURNING,   // 转向中
+  FALL_DONE 
+};
+bool fallLock = false;  // 防跌落锁定，用于阻止长按前进的反复
 FallState fallState = FALL_IDLE;
 unsigned long fallActionTime = 0;
 
@@ -135,6 +146,15 @@ volatile RandomMode randomMode = RANDOM_NORMAL;  // 当前随机模式
 
 /* ================= WiFi控制电机函数 ================= */
 void motorWifi(byte c) {
+   // 如果正在防跌落过程中，忽略前进命令
+  if (c == 1 && fallLock) {
+    // 强制停止电机
+    digitalWrite(LF, LOW); digitalWrite(LB, LOW);
+    digitalWrite(RF, LOW); digitalWrite(RB, LOW);
+    movingForward = false;
+    return;
+  }
+  
   digitalWrite(STBY, HIGH);
   switch (c) {
     case 0:
@@ -170,6 +190,7 @@ void stopAllMotors() {
   motorWifi(0);
   manualActive = false;
   currentCommand = 0;
+  fallLock = false;  // 用户主动停止，解除防跌落锁定
 }
 
 /* ================= 随机控制电机函数 ================= */
@@ -202,6 +223,7 @@ void checkCommandTimeout() {
   if (manualActive && (millis() - lastCommandTime > COMMAND_TIMEOUT)) {
     motorWifi(0);  // 停止电机
     manualActive = false;
+    fallLock = false;  // 命令超时，解除锁定
     Serial.println("命令超时，已停止");
   }
 }
@@ -251,8 +273,8 @@ void handleVoiceActionSequence() {
         Serial.println("跳舞：左转小半圈");
         break;
         
-      case 1: // 左转持续400ms
-        if (currentTime - danceState.stepTime >= 400) {
+      case 1: // 左转持续200ms
+        if (currentTime - danceState.stepTime >= 200) {
           motorWifi(0); // 立即停止
           danceState.step = 2;
           danceState.stepTime = currentTime;
@@ -266,8 +288,8 @@ void handleVoiceActionSequence() {
         Serial.println("跳舞：右转小半圈");
         break;
         
-      case 3: // 右转持续400ms
-        if (currentTime - danceState.stepTime >= 400) {
+      case 3: // 右转持续200ms
+        if (currentTime - danceState.stepTime >= 200) {
           motorWifi(0); // 立即停止
           danceState.step = 4;
           danceState.loopCount++;
@@ -363,6 +385,7 @@ void checkVoiceAction() {
       motorWifi(0); // 立即停止电机
       voiceActionActive = false;
       manualActive = false; // 允许恢复随机模式
+      fallLock = false;  // 语音动作完成，解除锁定
       Serial.println("语音动作完成");
     }
   }
@@ -1244,33 +1267,68 @@ void loop() {
 
   // 2. 防跌落触发判断（使用最新距离）
   if (fallState == FALL_IDLE && movingForward && latestDistance > edgeThreshold) {
-    Serial.println("防跌落触发！");
-    fallState = FALL_STOP;
-    motorWifi(0);
-    fallActionTime = millis();
+  fallLock = true;  // 触发防跌落时锁定前进
+  fallState = FALL_STOP;
+  motorWifi(0);
+  fallActionTime = millis();
+  
+  // 根据当前模式设置 fallMode
+  if (manualActive) {
+    fallMode = 0; // 手动模式
+  } else if (randomMode == RANDOM_NORMAL) {
+    fallMode = 1; // 好奇模式
+  } else {
+    fallMode = 0; // 其他模式默认手动
   }
+}
 
   // 3. 防跌落动作状态机
   switch (fallState) {
-    case FALL_STOP:
-      if (millis() - fallActionTime >= 100) {
-        motorWifi(2); // 后退
+  case FALL_STOP:
+    if (millis() - fallActionTime >= 100) {
+      motorWifi(2); // 后退
+      fallActionTime = millis();
+      fallState = FALL_BACKWARD;
+    }
+    break;
+    
+  case FALL_BACKWARD:
+    if (millis() - fallActionTime >= 200) { // 后退200ms
+      motorWifi(0);
+      if (fallMode == 1) {
+        // 好奇模式：准备转向
+        fallState = FALL_TURN;
         fallActionTime = millis();
-        fallState = FALL_BACKWARD;
-      }
-      break;
-    case FALL_BACKWARD:
-      if (millis() - fallActionTime >= 400) {
-        motorWifi(0); // 停止
+      } else {
+        // 手动模式：结束
         fallState = FALL_DONE;
       }
-      break;
-    case FALL_DONE:
-      fallState = FALL_IDLE;
-      break;
-    default:
-      break;
-  }
+    }
+    break;
+    
+  case FALL_TURN:
+    if (millis() - fallActionTime >= 100) { // 短暂停顿
+      // 随机选择左转或右转
+      if (random(2) == 0) motorWifi(3); else motorWifi(4);
+      fallActionTime = millis();
+      fallState = FALL_TURNING;
+    }
+    break;
+    
+  case FALL_TURNING:
+    if (millis() - fallActionTime >= 200) { // 转向200ms
+      motorWifi(0);
+      fallState = FALL_DONE;
+    }
+    break;
+    
+  case FALL_DONE:
+    fallState = FALL_IDLE;
+    break;
+    
+  default:
+    break;
+}
 
   // 随机模式控制 - 仅在非手动控制且非语音动作时执行
   static unsigned long lastTick = 0;
