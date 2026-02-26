@@ -9,6 +9,15 @@ Adafruit_VL53L0X lox = Adafruit_VL53L0X();
 bool sensorOK = false;            // 传感器状态
 uint16_t baseDistance = 0;   // 基准距离
 uint16_t edgeThreshold = 0;   // 防跌落阈值
+uint16_t obstacleThreshold = 0;      // 障碍阈值
+bool avoidingObstacle = false;       // 避障动作进行中标志
+unsigned long avoidStartTime = 0;    // 避障动作计时
+int avoidStep = 0;                   // 避障状态机步骤：0=空闲,1=停止,2=后退,3=转向准备,4=转向,5=完成
+unsigned long scanStartTime = 0;    // 旋转扫描开始时间
+int scanDirection = 1;              // 旋转方向：0左转，1右转（默认右转）
+int rotateStep = 0;                 // 当前旋转步数（0~12）
+const int MAX_ROTATE_STEPS = 12;    // 最大旋转步数（30°×12=360°）
+const unsigned long ROTATE_TIME_PER_STEP = 50; // 每30°旋转时间（ms），可根据实测调整
 bool movingForward = false;               // 是否正在前进
 
 // 防跌落动作状态机
@@ -447,14 +456,11 @@ void handleVoiceCommand() {
     
     // 指令映射
     if (voiceCommand == "STOP") {
-      // 进入睡眠模式
-      randomMode = RANDOM_OFF;
-      motorWifi(0);
-      manualActive = false;
-      voiceActionActive = false;
+      stopAllMotors();                // 停止电机，清除手动标志，解除防跌落锁
+      voiceActionActive = false;// 停止语音动作
       danceState = {0, 0, 0, false, false};
       singState = {0, 0, 0, false, false};
-      Serial.println("执行：睡眠模式");
+      Serial.println("执行：停止");
       
     } else if (voiceCommand == "CMD_FWD") {
       // 前进一小段
@@ -1121,18 +1127,18 @@ uint16_t getDistance() {
 }
 /* ================= 初始化设置 ================= */
 void setup() {
+    // 初始化电机引脚
+  pinMode(STBY, OUTPUT); digitalWrite(STBY, LOW);
+  pinMode(LF, OUTPUT); pinMode(LB, OUTPUT);
+  pinMode(RF, OUTPUT); pinMode(RB, OUTPUT);
+  Serial.println("电机引脚初始化完成");
+
   // 增加启动延迟
   delay(2000);
 
   // 初始化串口通信
   Serial.begin(115200);
   Serial.println("===== 桌面机器人启动 =====");
-
-  // 初始化电机引脚
-  pinMode(STBY, OUTPUT); digitalWrite(STBY, LOW);
-  pinMode(LF, OUTPUT); pinMode(LB, OUTPUT);
-  pinMode(RF, OUTPUT); pinMode(RB, OUTPUT);
-  Serial.println("电机引脚初始化完成");
 
   // 初始化OLED显示屏
   Wire.begin(OLED_SDA, OLED_SCL);
@@ -1203,8 +1209,10 @@ void setup() {
       delay(50);
     }
     baseDistance = sumDist / 10;
-    edgeThreshold = baseDistance + 30; // 防跌落阈值 = 基准 + 30mm
-
+    edgeThreshold = baseDistance + 20; // 防跌落阈值 = 基准 + 20mm
+    obstacleThreshold = baseDistance - 20; // 障碍阈值 = 基准 - 20mm
+    if (obstacleThreshold < 30) obstacleThreshold = 30; // 避免低于盲区
+    Serial.print("障碍阈值: "); Serial.println(obstacleThreshold);
     Serial.print("基准距离: "); Serial.print(baseDistance); Serial.println(" mm");
     Serial.print("防跌落阈值: "); Serial.print(edgeThreshold); Serial.println(" mm");
 
@@ -1267,6 +1275,7 @@ void loop() {
 
   // 2. 防跌落触发判断（使用最新距离）
   if (fallState == FALL_IDLE && movingForward && latestDistance > edgeThreshold) {
+  avoidingObstacle = false;  // 中止避障
   fallLock = true;  // 触发防跌落时锁定前进
   fallState = FALL_STOP;
   motorWifi(0);
@@ -1293,7 +1302,7 @@ void loop() {
     break;
     
   case FALL_BACKWARD:
-    if (millis() - fallActionTime >= 200) { // 后退200ms
+    if (millis() - fallActionTime >= 100) { // 后退100ms
       motorWifi(0);
       if (fallMode == 1) {
         // 好奇模式：准备转向
@@ -1316,7 +1325,7 @@ void loop() {
     break;
     
   case FALL_TURNING:
-    if (millis() - fallActionTime >= 200) { // 转向200ms
+    if (millis() - fallActionTime >= 150) { // 转向150ms
       motorWifi(0);
       fallState = FALL_DONE;
     }
@@ -1330,7 +1339,69 @@ void loop() {
     break;
 }
 
-  // 随机模式控制 - 仅在非手动控制且非语音动作时执行
+// ========== 3. 避障逻辑（仅在好奇模式、非手动、非语音、未防跌落时） ==========
+if (!manualActive && !voiceActionActive && randomMode == RANDOM_NORMAL && fallState == FALL_IDLE) {
+  // 触发条件：最新距离小于障碍阈值且未在避障中
+  if (!avoidingObstacle && latestDistance < obstacleThreshold) {
+    Serial.println("避障触发，开始步进旋转扫描");
+    avoidingObstacle = true;
+    rotateStep = 0;
+    avoidStep = 1;                // 进入旋转状态
+    motorWifi(4);                  // 开始右转
+    avoidStartTime = millis();     // 记录旋转开始时间
+  }
+  
+  // 避障状态机
+  if (avoidingObstacle) {
+    switch (avoidStep) {
+      case 1: // 旋转中（持续ROTATE_TIME_PER_STEP毫秒）
+        if (millis() - avoidStartTime >= ROTATE_TIME_PER_STEP) {
+          motorWifi(0);            // 停止旋转
+          avoidStartTime = millis();
+          avoidStep = 2;            // 进入检测状态
+        }
+        break;
+
+      case 2: // 停顿并检测出路
+        {
+          uint16_t currentDist = getDistance(); // 使用原始距离快速检测
+          if (currentDist > obstacleThreshold + 20) { // 恢复正常（加20mm余量）
+            Serial.println("扫描到出路，准备前进");
+            avoidStep = 3;           // 进入前进状态
+            motorWifi(1);            // 开始前进
+            avoidStartTime = millis();
+          } else {
+            rotateStep++;
+            if (rotateStep >= MAX_ROTATE_STEPS) {
+              Serial.println("未找到出路，进入睡眠模式");
+              motorWifi(0);
+              randomMode = RANDOM_OFF;  // 切换到睡眠模式
+              avoidingObstacle = false; // 结束避障
+              // 可选：让眼睛显示睡眠表情（需自行添加）
+            } else {
+              // 继续下一旋转
+              motorWifi(4);           // 继续右转
+              avoidStartTime = millis();
+              avoidStep = 1;
+            }
+          }
+        }
+        break;
+
+      case 3: // 前进一小段
+        if (millis() - avoidStartTime >= 100) { // 前进100ms
+          motorWifi(0);
+          avoidingObstacle = false;   // 避障完成
+        }
+        break;
+
+      default:
+        avoidingObstacle = false;
+        break;
+    }
+  }
+}
+  // ========== 4. 随机模式控制 ========== 仅在非手动控制且非语音动作时执行
   static unsigned long lastTick = 0;
   if (!manualActive && !voiceActionActive && millis() - lastTick > 40) {
     lastTick = millis();
