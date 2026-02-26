@@ -1215,7 +1215,8 @@ void setup() {
     Serial.print("障碍阈值: "); Serial.println(obstacleThreshold);
     Serial.print("基准距离: "); Serial.print(baseDistance); Serial.println(" mm");
     Serial.print("防跌落阈值: "); Serial.print(edgeThreshold); Serial.println(" mm");
-
+    latestDistance = baseDistance; // 防止启动时误触发避障
+    
     // 在OLED上显示校准结果（2秒）
     display.clearDisplay();
     display.setTextSize(1);
@@ -1274,7 +1275,43 @@ void loop() {
   updateFilter();
 
   // 2. 防跌落触发判断（使用最新距离）
-  if (fallState == FALL_IDLE && movingForward && latestDistance > edgeThreshold) {
+uint16_t rawDistance = getDistance(); // 实时读取一次
+
+  // 异常环境检测（玻璃桌面等）
+static int abnormalCount = 0;
+static int normalCount = 0;      // 用于连续正常计数，实现自动唤醒
+const uint16_t ABNORMAL_THRESHOLD = 200; // 可根据实际调整
+const int ABNORMAL_MAX = 5;        // 连续5次异常触发睡眠
+const int NORMAL_MAX = 5;          // 连续5次正常唤醒
+
+if (rawDistance > ABNORMAL_THRESHOLD) {
+    abnormalCount++;
+    normalCount = 0;               // 一旦出现异常，清零正常计数
+    if (abnormalCount >= ABNORMAL_MAX) {
+        Serial.println("检测到异常环境，进入睡眠模式");
+        roboEyes.anim_confused();   // 播放困惑动画
+        roboEyes.setMood(TIRED);    // 设置疲惫表情
+        randomMode = RANDOM_OFF;
+        motorWifi(0);
+        ASRSerial.println("SLEEP");
+        abnormalCount = 0;          // 重置异常计数，避免重复触发
+    }
+} else {
+    abnormalCount = 0;
+    if (randomMode == RANDOM_OFF) {
+        normalCount++;
+        if (normalCount >= NORMAL_MAX) {
+            Serial.println("环境恢复正常，退出睡眠模式");
+            randomMode = RANDOM_NORMAL;   // 恢复好奇模式
+            roboEyes.setMood(DEFAULT);     // 恢复默认表情
+            normalCount = 0;
+        }
+    } else {
+        normalCount = 0; // 非睡眠模式下，正常计数保持0
+    }
+}
+
+if (fallState == FALL_IDLE && movingForward && rawDistance > edgeThreshold) {
   avoidingObstacle = false;  // 中止避障
   fallLock = true;  // 触发防跌落时锁定前进
   fallState = FALL_STOP;
@@ -1374,8 +1411,11 @@ if (!manualActive && !voiceActionActive && randomMode == RANDOM_NORMAL && fallSt
             rotateStep++;
             if (rotateStep >= MAX_ROTATE_STEPS) {
               Serial.println("未找到出路，进入睡眠模式");
+              roboEyes.anim_confused();  // 播放困惑动画
+              roboEyes.setMood(TIRED);   // 播放疲惫动画
               motorWifi(0);
               randomMode = RANDOM_OFF;  // 切换到睡眠模式
+              ASRSerial.println("SLEEP");
               avoidingObstacle = false; // 结束避障
               // 可选：让眼睛显示睡眠表情（需自行添加）
             } else {
@@ -1401,24 +1441,46 @@ if (!manualActive && !voiceActionActive && randomMode == RANDOM_NORMAL && fallSt
     }
   }
 }
-  // ========== 4. 随机模式控制 ========== 仅在非手动控制且非语音动作时执行
-  static unsigned long lastTick = 0;
-  if (!manualActive && !voiceActionActive && millis() - lastTick > 40) {
+// ========== 4. 随机模式控制 ==========
+static unsigned long lastTick = 0;
+if (!manualActive && !voiceActionActive && millis() - lastTick > 40) {
     lastTick = millis();
 
+    // 定义允许的动作列表（左转、右转、前进）
+    const byte allowedMoves[] = {1, 2, 4};
+    const int moveCount = 3;
+
     if (randomMode == RANDOM_SOFT) {
-      // 柔和随机模式：低频率小幅度动作
-      if (random(120) == 1) {
-        MOTOR(random(9), random(6, 18), random(40, 90), 1);
-      }
+        if (random(120) == 1) {
+            byte cmd = allowedMoves[random(moveCount)];
+            int t1_val = random(6, 18);
+            int t2_val = random(40, 90);
+            int Time_val = 1; // 柔和模式固定循环1次
+            // 打印参数
+            Serial.print("随机动作: cmd="); Serial.print(cmd);
+            Serial.print(" t1="); Serial.print(t1_val);
+            Serial.print(" t2="); Serial.print(t2_val);
+            Serial.print(" Time="); Serial.println(Time_val);
+            // 执行动作
+            MOTOR(cmd, t1_val, t2_val, Time_val);
+        }
     }
     else if (randomMode == RANDOM_NORMAL) {
-      // 正常随机模式：较高频率和幅度动作
-      if (random(100) == 1) {
-        MOTOR(random(9), random(5, 50), random(10, 100), random(20));
-      }
+        if (random(100) == 1) {
+            byte cmd = allowedMoves[random(moveCount)];
+            int t1_val = random(5, 50);
+            int t2_val = random(10, 100);
+            int Time_val = random(20);
+            // 打印参数
+            Serial.print("随机动作: cmd="); Serial.print(cmd);
+            Serial.print(" t1="); Serial.print(t1_val);
+            Serial.print(" t2="); Serial.print(t2_val);
+            Serial.print(" Time="); Serial.println(Time_val);
+            // 执行动作
+            MOTOR(cmd, t1_val, t2_val, Time_val);
+        }
     }
-  }
+}
 
   // 每5秒打印一次连接状态
   static unsigned long lastStatus = 0;
