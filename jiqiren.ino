@@ -20,6 +20,8 @@ const int MAX_ROTATE_STEPS = 12;    // 最大旋转步数（30°×12=360°）
 const unsigned long ROTATE_TIME_PER_STEP = 50; // 每30°旋转时间（ms），可根据实测调整
 bool movingForward = false;               // 是否正在前进
 bool sleepByObstacle = false; // 是否为避障超时导致的睡眠
+const uint8_t randomMoods[] = {HAPPY, ANGRY, TIRED};
+const int moodCount = 3;
 
 // 边缘逃避状态机
 int safeSeekState = 0; // 0=旋转中, 1=检测中
@@ -492,6 +494,10 @@ void handleVoiceCommand() {
           safeSeekState = 0;
           safeSeekStep = 0;
       }
+      // 新增：中止随机动作，恢复默认表情
+      randomActive = false;
+      roboEyes.setMood(DEFAULT);
+
       wakeupFromSleep();
       // 前进一小段
       motorWifi(1);
@@ -509,6 +515,10 @@ void handleVoiceCommand() {
           safeSeekState = 0;
           safeSeekStep = 0;
       }
+      // 新增：中止随机动作，恢复默认表情
+      randomActive = false;
+      roboEyes.setMood(DEFAULT);
+      
       wakeupFromSleep();
       // 后退一小段
       motorWifi(2);
@@ -526,6 +536,10 @@ void handleVoiceCommand() {
           safeSeekState = 0;
           safeSeekStep = 0;
       }
+      // 新增：中止随机动作，恢复默认表情
+      randomActive = false;
+      roboEyes.setMood(DEFAULT);
+      
       wakeupFromSleep();
       // 左转一小段（100ms）
       motorWifi(3);
@@ -543,6 +557,10 @@ void handleVoiceCommand() {
           safeSeekState = 0;
           safeSeekStep = 0;
       }
+      // 新增：中止随机动作，恢复默认表情
+      randomActive = false;
+      roboEyes.setMood(DEFAULT);
+      
       wakeupFromSleep();
       // 右转一小段（幅100ms）
       motorWifi(4);
@@ -1094,6 +1112,10 @@ void setupServer() {
         safeSeekState = 0;
         safeSeekStep = 0;
     }
+    // 新增：中止随机动作，恢复默认表情
+    randomActive = false;
+    roboEyes.setMood(DEFAULT);
+
     wakeupFromSleep();//脱困后唤醒
     manualActive = true;
     currentCommand = 1;
@@ -1112,6 +1134,10 @@ void setupServer() {
         safeSeekState = 0;
         safeSeekStep = 0;
     }
+    // 新增：中止随机动作，恢复默认表情
+    randomActive = false;
+    roboEyes.setMood(DEFAULT);
+    
     wakeupFromSleep();//脱困后唤醒
     manualActive = true;
     currentCommand = 2;
@@ -1130,6 +1156,10 @@ void setupServer() {
         safeSeekState = 0;
         safeSeekStep = 0;
     }
+    // 新增：中止随机动作，恢复默认表情
+    randomActive = false;
+    roboEyes.setMood(DEFAULT);
+    
     wakeupFromSleep();//脱困后唤醒
     manualActive = true;
     currentCommand = 3;
@@ -1148,6 +1178,10 @@ void setupServer() {
         safeSeekState = 0;
         safeSeekStep = 0;
     }
+    // 新增：中止随机动作，恢复默认表情
+    randomActive = false;
+    roboEyes.setMood(DEFAULT);
+    
     wakeupFromSleep();//脱困后唤醒
     manualActive = true;
     currentCommand = 4;
@@ -1473,6 +1507,7 @@ if (randomMode != RANDOM_OFF && rawDistance > ABNORMAL_THRESHOLD) {
 }
 
 if (fallState == FALL_IDLE && movingForward && rawDistance > edgeThreshold) {
+  roboEyes.setMood(DEFAULT);
   randomActive = false;  // 中止随机动作
   avoidingObstacle = false;  // 中止避障
   seekingSafeDir = false;  // 中止边缘逃避
@@ -1543,6 +1578,7 @@ if (fallState == FALL_IDLE && movingForward && rawDistance > edgeThreshold) {
 if (!manualActive && !voiceActionActive && randomMode == RANDOM_NORMAL && fallState == FALL_IDLE) {
   // 触发条件：最新距离小于障碍阈值且未在避障中
   if (!avoidingObstacle && rawDistance < obstacleThreshold) {
+    roboEyes.setMood(DEFAULT);
     randomActive = false;  // 中止随机动作
     seekingSafeDir = false;  // 中止边缘逃避
     motorWifi(0); // 确保停止
@@ -1632,6 +1668,7 @@ if (randomActive) {
                     randomStep = 1;
                 } else {
                     randomActive = false; // 完成
+                    roboEyes.setMood(DEFAULT);  // 恢复默认表情
                     if (randomCmd == 3 || randomCmd == 4) {
                        uint16_t currentDist = getDistance();
                        if (currentDist > ABNORMAL_THRESHOLD) {
@@ -1718,6 +1755,7 @@ if (!manualActive && !voiceActionActive && !randomActive && millis() - lastTick 
             Serial.print(" repeat="); Serial.println(randomRepeat);
             randomActive = true;
             randomStep = 1; // 进入动作阶段
+            roboEyes.setMood(randomMoods[random(moodCount)]);// 随机选择表情
             motorWifi(randomCmd); // 开始动作
             randomActionTime = millis();
         }
@@ -1734,6 +1772,7 @@ if (!manualActive && !voiceActionActive && !randomActive && millis() - lastTick 
             Serial.print(" repeat="); Serial.println(randomRepeat);
             randomActive = true;
             randomStep = 1;
+            roboEyes.setMood(randomMoods[random(moodCount)]);// 随机选择表情
             motorWifi(randomCmd);
             randomActionTime = millis();
         }
