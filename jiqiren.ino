@@ -19,6 +19,24 @@ int rotateStep = 0;                 // 当前旋转步数（0~12）
 const int MAX_ROTATE_STEPS = 12;    // 最大旋转步数（30°×12=360°）
 const unsigned long ROTATE_TIME_PER_STEP = 50; // 每30°旋转时间（ms），可根据实测调整
 bool movingForward = false;               // 是否正在前进
+bool sleepByObstacle = false; // 是否为避障超时导致的睡眠
+
+// 边缘逃避状态机
+int safeSeekState = 0; // 0=旋转中, 1=检测中
+bool seekingSafeDir = false;          // 是否正在寻找安全方向
+int safeSeekStep = 0;                 // 当前旋转步数
+unsigned long safeSeekStartTime = 0;  // 旋转开始时间
+const int SAFE_SEEK_STEPS = 12;       // 最多旋转12步（30°×12=360°）
+const unsigned long SAFE_ROTATE_TIME = 50; // 每步旋转时间（与避障一致）
+
+// 随机动作状态机
+bool randomActive = false;          // 是否正在执行随机动作
+int randomStep = 0;                  // 0=空闲,1=动作中,2=停顿中
+byte randomCmd = 0;                  // 当前动作指令
+int randomT1 = 0;                     // 动作持续时间
+int randomT2 = 0;                     // 停顿时间
+int randomRepeat = 0;                 // 剩余循环次数
+unsigned long randomActionTime = 0;   // 动作/停顿开始时间
 
 // 防跌落动作状态机
 // 防跌落动作模式：0=手动模式（仅后退停止），1=好奇模式（后退+转向）
@@ -252,6 +270,7 @@ void handleVoiceActionSequence() {
   if (voiceActionType == 5 && danceState.resetFlag) {
     voiceSequenceLock = true; // 锁定序列动作
     delay(50); // 短暂延迟确保稳定
+    roboEyes.setMood(DEFAULT);             // 恢复默认表情
     danceState = {0, 0, 0, false, false};
     voiceActionActive = false;
     manualActive = false;
@@ -312,6 +331,7 @@ void handleVoiceActionSequence() {
         if (danceState.loopCount < 2) { // 需要循环2次
           danceState.step = 0; // 重新开始左转
         } else {
+          roboEyes.setMood(DEFAULT);         // 恢复默认表情
           // 跳舞完成
           delay(100); // 完成延迟
           voiceActionActive = false;
@@ -366,6 +386,7 @@ void handleVoiceActionSequence() {
         if (singState.loopCount < 1) { // 需要循环1次
           singState.step = 0; // 重新开始左转
         } else {
+          roboEyes.setMood(DEFAULT);         // 恢复默认表情
           // 唱歌完成
           delay(100); // 完成延迟
           voiceActionActive = false;
@@ -456,6 +477,7 @@ void handleVoiceCommand() {
     
     // 指令映射
     if (voiceCommand == "STOP") {
+      wakeupFromSleep();//脱困后唤醒
       stopAllMotors();                // 停止电机，清除手动标志，解除防跌落锁
       voiceActionActive = false;// 停止语音动作
       danceState = {0, 0, 0, false, false};
@@ -463,6 +485,14 @@ void handleVoiceCommand() {
       Serial.println("执行：停止");
       
     } else if (voiceCommand == "CMD_FWD") {
+      // 中止边缘逃避
+      if (seekingSafeDir) {
+          motorWifi(0);
+          seekingSafeDir = false;
+          safeSeekState = 0;
+          safeSeekStep = 0;
+      }
+      wakeupFromSleep();
       // 前进一小段
       motorWifi(1);
       voiceActionActive = true;
@@ -472,6 +502,14 @@ void handleVoiceCommand() {
       Serial.println("执行：前进一小段");
       
     } else if (voiceCommand == "CMD_BACK") {
+      // 中止边缘逃避
+      if (seekingSafeDir) {
+          motorWifi(0);
+          seekingSafeDir = false;
+          safeSeekState = 0;
+          safeSeekStep = 0;
+      }
+      wakeupFromSleep();
       // 后退一小段
       motorWifi(2);
       voiceActionActive = true;
@@ -481,25 +519,42 @@ void handleVoiceCommand() {
       Serial.println("执行：后退一小段");
       
     } else if (voiceCommand == "CMD_LEFT") {
-      // 左转一小段（幅度减半：200ms）
+      // 中止边缘逃避
+      if (seekingSafeDir) {
+          motorWifi(0);
+          seekingSafeDir = false;
+          safeSeekState = 0;
+          safeSeekStep = 0;
+      }
+      wakeupFromSleep();
+      // 左转一小段（100ms）
       motorWifi(3);
       voiceActionActive = true;
       voiceActionStartTime = millis();
-      voiceActionDuration = 200;
+      voiceActionDuration = 100;
       voiceActionType = 3;
       Serial.println("执行：左转一小段（幅度减半）");
       
     } else if (voiceCommand == "CMD_RIGHT") {
-      // 右转一小段（幅度减半：200ms）
+      // 中止边缘逃避
+      if (seekingSafeDir) {
+          motorWifi(0);
+          seekingSafeDir = false;
+          safeSeekState = 0;
+          safeSeekStep = 0;
+      }
+      wakeupFromSleep();
+      // 右转一小段（幅100ms）
       motorWifi(4);
       voiceActionActive = true;
       voiceActionStartTime = millis();
-      voiceActionDuration = 200;
+      voiceActionDuration = 100;
       voiceActionType = 4;
       Serial.println("执行：右转一小段（幅度减半）");
       
     } else if (voiceCommand == "DANCE") {
       // 跳舞：左转小半圈，右转小半圈，循环2次后停止
+      roboEyes.setMood(HAPPY);               // <-- 新增：设置开心表情
       voiceActionActive = true;
       danceState = {0, 0, millis(), true, false};
       voiceActionType = 5;
@@ -507,6 +562,7 @@ void handleVoiceCommand() {
       
     } else if (voiceCommand == "SING") {
       // 唱歌：左转一圈，右转一圈，循环1次后停止（速度减半）
+      roboEyes.setMood(HAPPY);               // <-- 新增：设置开心表情
       voiceActionActive = true;
       singState = {0, 0, millis(), true, false};
       voiceActionType = 6;
@@ -804,7 +860,7 @@ h2 {
 
 <div class="mode">
   <button id="btn_sleep" onclick="setMode('off')">睡眠模式</button>
-  <button id="btn_wiggle" onclick="setMode('soft')">摆动模式</button>
+  <button id="btn_wiggle" onclick="setMode('soft')">轻柔模式</button>
   <button id="btn_curious" class="active" onclick="setMode('normal')">好奇模式</button>
 </div>
 
@@ -873,7 +929,7 @@ function sendCommand(cmd) {
       // 检查是否是模式切换响应，如果是则更新按钮状态
       if (text.includes('已切换到睡眠模式')) {
         updateModeButtons('off');
-      } else if (text.includes('已切换到摆动模式')) {
+      } else if (text.includes('已切换到轻柔模式')) {
         updateModeButtons('soft');
       } else if (text.includes('已切换到好奇模式')) {
         updateModeButtons('normal');
@@ -1031,6 +1087,14 @@ void setupServer() {
 
   // 控制路由 - 改为持续动作直到收到停止命令
   server.on("/f", []() {
+    // 中止边缘逃避
+    if (seekingSafeDir) {
+        motorWifi(0);
+        seekingSafeDir = false;
+        safeSeekState = 0;
+        safeSeekStep = 0;
+    }
+    wakeupFromSleep();//脱困后唤醒
     manualActive = true;
     currentCommand = 1;
     motorWifi(currentCommand);
@@ -1041,6 +1105,14 @@ void setupServer() {
   });
 
   server.on("/b", []() {
+    // 中止边缘逃避
+    if (seekingSafeDir) {
+        motorWifi(0);
+        seekingSafeDir = false;
+        safeSeekState = 0;
+        safeSeekStep = 0;
+    }
+    wakeupFromSleep();//脱困后唤醒
     manualActive = true;
     currentCommand = 2;
     motorWifi(currentCommand);
@@ -1051,6 +1123,14 @@ void setupServer() {
   });
 
   server.on("/l", []() {
+    // 中止边缘逃避
+    if (seekingSafeDir) {
+        motorWifi(0);
+        seekingSafeDir = false;
+        safeSeekState = 0;
+        safeSeekStep = 0;
+    }
+    wakeupFromSleep();//脱困后唤醒
     manualActive = true;
     currentCommand = 3;
     motorWifi(currentCommand);
@@ -1061,6 +1141,14 @@ void setupServer() {
   });
 
   server.on("/r", []() {
+    // 中止边缘逃避
+    if (seekingSafeDir) {
+        motorWifi(0);
+        seekingSafeDir = false;
+        safeSeekState = 0;
+        safeSeekStep = 0;
+    }
+    wakeupFromSleep();//脱困后唤醒
     manualActive = true;
     currentCommand = 4;
     motorWifi(currentCommand);
@@ -1079,34 +1167,80 @@ void setupServer() {
 
   // 模式切换路由
   server.on("/mode_off", []() {
+    // 中止边缘逃避
+    if (seekingSafeDir) {
+        motorWifi(0);
+        seekingSafeDir = false;
+        safeSeekState = 0;
+        safeSeekStep = 0;
+    }
     randomMode = RANDOM_OFF;
+    sleepByObstacle = true;          // 标记为手动睡眠，避免自动唤醒
+    // 关闭自动眨眼和空闲模式
+    roboEyes.setAutoblinker(OFF);
+    roboEyes.setIdleMode(OFF);
+    // 设置睡眠表情
+    roboEyes.close();
+    roboEyes.setSweat(true);
     stopAllMotors();
     voiceActionActive = false;
     danceState = {0, 0, 0, false, false};
     singState = {0, 0, 0, false, false};
     Serial.println("切换到睡眠模式");
+    ASRSerial.print("mode_off");
+    Serial.println("mode_off 已发送");                 // 添加日志输出确认发送
     server.sendHeader("Content-Type", "text/plain; charset=utf-8");
     server.send(200, "text/plain", "已切换到睡眠模式");
   });
 
   server.on("/mode_soft", []() {
+    // 中止边缘逃避
+    if (seekingSafeDir) {
+        motorWifi(0);
+        seekingSafeDir = false;
+        safeSeekState = 0;
+        safeSeekStep = 0;
+    }
     randomMode = RANDOM_SOFT;
+    // 重置眼睛表情到默认
+    roboEyes.setAutoblinker(ON, 3, 2);
+    roboEyes.setIdleMode(ON, 2, 2);
+    roboEyes.open();
+    roboEyes.setSweat(false);
+    roboEyes.setMood(DEFAULT);
     stopAllMotors();
     voiceActionActive = false;
     danceState = {0, 0, 0, false, false};
     singState = {0, 0, 0, false, false};
-    Serial.println("切换到摆动模式");
+    Serial.println("切换到轻柔模式");
+    ASRSerial.print("mode_soft");
+    Serial.println("mode_soft 已发送");                 // 添加日志输出确认发送
     server.sendHeader("Content-Type", "text/plain; charset=utf-8");
-    server.send(200, "text/plain", "已切换到摆动模式");
+    server.send(200, "text/plain", "已切换到轻柔模式");
   });
 
   server.on("/mode_normal", []() {
+    // 中止边缘逃避
+    if (seekingSafeDir) {
+        motorWifi(0);
+        seekingSafeDir = false;
+        safeSeekState = 0;
+        safeSeekStep = 0;
+    }
     randomMode = RANDOM_NORMAL;
+    // 重置眼睛表情到默认
+    roboEyes.setAutoblinker(ON, 3, 2);
+    roboEyes.setIdleMode(ON, 2, 2);
+    roboEyes.open();
+    roboEyes.setSweat(false);
+    roboEyes.setMood(DEFAULT);
     stopAllMotors();
     voiceActionActive = false;
     danceState = {0, 0, 0, false, false};
     singState = {0, 0, 0, false, false};
     Serial.println("切换到好奇模式");
+    ASRSerial.print("mode_normal");
+    Serial.println("mode_normal 已发送");                 // 添加日志输出确认发送
     server.sendHeader("Content-Type", "text/plain; charset=utf-8");
     server.send(200, "text/plain", "已切换到好奇模式");
   });
@@ -1277,45 +1411,74 @@ void loop() {
   // 2. 防跌落触发判断（使用最新距离）
 uint16_t rawDistance = getDistance(); // 实时读取一次
 
-  // 异常环境检测（玻璃桌面等）
+  // 异常环境检测（玻璃桌面、悬空等）
 static int abnormalCount = 0;
 static int normalCount = 0;      // 用于连续正常计数，实现自动唤醒
 const uint16_t ABNORMAL_THRESHOLD = 200; // 可根据实际调整
 const int ABNORMAL_MAX = 5;        // 连续5次异常触发睡眠
 const int NORMAL_MAX = 5;          // 连续5次正常唤醒
 
-if (rawDistance > ABNORMAL_THRESHOLD) {
-    abnormalCount++;
-    normalCount = 0;               // 一旦出现异常，清零正常计数
-    if (abnormalCount >= ABNORMAL_MAX) {
-        Serial.println("检测到异常环境，进入睡眠模式");
-        roboEyes.anim_confused();   // 播放困惑动画
-        roboEyes.setMood(TIRED);    // 设置疲惫表情
-        randomMode = RANDOM_OFF;
-        motorWifi(0);
-        ASRSerial.println("SLEEP");
-        abnormalCount = 0;          // 重置异常计数，避免重复触发
+if (randomMode != RANDOM_OFF && rawDistance > ABNORMAL_THRESHOLD) {
+    // 如果正在寻找安全方向，继续旋转
+    if (seekingSafeDir) {
+        normalCount = 0;
+    } else {
+        // 不在寻找中，且不在随机动作中，且不在手动控制，则累计异常计数
+        if (!randomActive && !manualActive && !voiceActionActive) {
+            abnormalCount++;
+            if (abnormalCount >= ABNORMAL_MAX) {
+                Serial.println("检测到异常环境，进入睡眠模式");
+                roboEyes.anim_confused();
+                roboEyes.setMood(TIRED);
+                randomMode = RANDOM_OFF;
+                sleepByObstacle = false;
+                motorWifi(0);
+                sendSleepMultiple(3);  // 播放3次help
+                Serial.println("HELP 已发送");                 // 添加日志输出确认发送
+                abnormalCount = 0;
+            }
+        } else {
+            // 如果在随机动作或手动控制中，不计数，避免误判
+            abnormalCount = 0;
+        }
     }
+    normalCount = 0; // 只要距离异常，就清零正常计数
 } else {
+    // 距离正常
+    if (seekingSafeDir) {
+        // 如果正在寻找方向，则立即停止，恢复正常
+        motorWifi(0);
+        seekingSafeDir = false;
+        Serial.println("找到安全方向，停止旋转");
+    }
+    // 自动唤醒逻辑
     abnormalCount = 0;
-    if (randomMode == RANDOM_OFF) {
-        normalCount++;
-        if (normalCount >= NORMAL_MAX) {
-            Serial.println("环境恢复正常，退出睡眠模式");
-            randomMode = RANDOM_NORMAL;   // 恢复好奇模式
-            roboEyes.setMood(DEFAULT);     // 恢复默认表情
-            normalCount = 0;
+    // 仅当非避障睡眠时才尝试自动唤醒
+    if (randomMode == RANDOM_OFF && !sleepByObstacle) {
+        // 距离在合理的正常桌面范围内（如50mm~200mm）才累加唤醒计数
+        if (rawDistance > 50 && rawDistance < ABNORMAL_THRESHOLD) {
+            normalCount++;
+            if (normalCount >= NORMAL_MAX) {
+                Serial.println("环境恢复正常，退出睡眠模式");
+                randomMode = RANDOM_NORMAL;
+                roboEyes.setMood(DEFAULT);
+                normalCount = 0;
+            }
+        } else {
+            normalCount = 0; // 距离不在正常范围，清零计数，避免误唤醒
         }
     } else {
-        normalCount = 0; // 非睡眠模式下，正常计数保持0
+        normalCount = 0;
     }
 }
 
 if (fallState == FALL_IDLE && movingForward && rawDistance > edgeThreshold) {
+  randomActive = false;  // 中止随机动作
   avoidingObstacle = false;  // 中止避障
+  seekingSafeDir = false;  // 中止边缘逃避
+  motorWifi(0); // 确保停止
   fallLock = true;  // 触发防跌落时锁定前进
   fallState = FALL_STOP;
-  motorWifi(0);
   fallActionTime = millis();
   
   // 根据当前模式设置 fallMode
@@ -1379,7 +1542,10 @@ if (fallState == FALL_IDLE && movingForward && rawDistance > edgeThreshold) {
 // ========== 3. 避障逻辑（仅在好奇模式、非手动、非语音、未防跌落时） ==========
 if (!manualActive && !voiceActionActive && randomMode == RANDOM_NORMAL && fallState == FALL_IDLE) {
   // 触发条件：最新距离小于障碍阈值且未在避障中
-  if (!avoidingObstacle && latestDistance < obstacleThreshold) {
+  if (!avoidingObstacle && rawDistance < obstacleThreshold) {
+    randomActive = false;  // 中止随机动作
+    seekingSafeDir = false;  // 中止边缘逃避
+    motorWifi(0); // 确保停止
     Serial.println("避障触发，开始步进旋转扫描");
     avoidingObstacle = true;
     rotateStep = 0;
@@ -1389,95 +1555,187 @@ if (!manualActive && !voiceActionActive && randomMode == RANDOM_NORMAL && fallSt
   }
   
   // 避障状态机
-  if (avoidingObstacle) {
+ if (avoidingObstacle) {
     switch (avoidStep) {
-      case 1: // 旋转中（持续ROTATE_TIME_PER_STEP毫秒）
-        if (millis() - avoidStartTime >= ROTATE_TIME_PER_STEP) {
-          motorWifi(0);            // 停止旋转
-          avoidStartTime = millis();
-          avoidStep = 2;            // 进入检测状态
-        }
-        break;
-
-      case 2: // 停顿并检测出路
-        {
-          uint16_t currentDist = getDistance(); // 使用原始距离快速检测
-          if (currentDist > obstacleThreshold + 20) { // 恢复正常（加20mm余量）
-            Serial.println("扫描到出路，准备前进");
-            avoidStep = 3;           // 进入前进状态
-            motorWifi(1);            // 开始前进
-            avoidStartTime = millis();
-          } else {
-            rotateStep++;
-            if (rotateStep >= MAX_ROTATE_STEPS) {
-              Serial.println("未找到出路，进入睡眠模式");
-              roboEyes.anim_confused();  // 播放困惑动画
-              roboEyes.setMood(TIRED);   // 播放疲惫动画
-              motorWifi(0);
-              randomMode = RANDOM_OFF;  // 切换到睡眠模式
-              ASRSerial.println("SLEEP");
-              avoidingObstacle = false; // 结束避障
-              // 可选：让眼睛显示睡眠表情（需自行添加）
-            } else {
-              // 继续下一旋转
-              motorWifi(4);           // 继续右转
-              avoidStartTime = millis();
-              avoidStep = 1;
+        case 1: // 旋转中
+            if (millis() - avoidStartTime >= ROTATE_TIME_PER_STEP) {
+                motorWifi(0);           // 停止旋转
+                avoidStartTime = millis();
+                avoidStep = 2;           // 进入停顿检测状态
             }
-          }
-        }
-        break;
+            break;
 
-      case 3: // 前进一小段
-        if (millis() - avoidStartTime >= 100) { // 前进100ms
-          motorWifi(0);
-          avoidingObstacle = false;   // 避障完成
-        }
-        break;
+        case 2: // 停顿检测
+            // 停顿足够时间让电机停稳（例如100ms）
+            if (millis() - avoidStartTime >= 100) {
+                uint16_t currentDist = getDistance(); // 读取距离
+                if (currentDist > obstacleThreshold + 20) {
+                    // 找到出路，进入前进状态
+                    Serial.println("扫描到出路，准备前进");
+                    avoidStep = 3;
+                    motorWifi(1);        // 开始前进
+                    avoidStartTime = millis();
+                } else {
+                    rotateStep++;
+                    if (rotateStep >= MAX_ROTATE_STEPS) {
+                        // 旋转超时，进入睡眠
+                        Serial.println("未找到出路，进入睡眠模式");
+                        roboEyes.anim_confused();
+                        roboEyes.setMood(TIRED);
+                        motorWifi(0);
+                        randomMode = RANDOM_OFF;
+                        sleepByObstacle = true;
+                        sendSleepMultiple(3);  // 播放3次help
+                        Serial.println("HELP 已发送");                 // 添加日志输出确认发送
+                        avoidingObstacle = false;
+                    } else {
+                        // 继续下一次旋转
+                        motorWifi(4);     // 继续右转
+                        avoidStartTime = millis();
+                        avoidStep = 1;     // 回到旋转状态
+                    }
+                }
+            }
+            break;
 
-      default:
-        avoidingObstacle = false;
-        break;
+        case 3: // 前进一小段
+            if (millis() - avoidStartTime >= 100) {
+                motorWifi(0);
+                avoidingObstacle = false; // 避障完成
+            }
+            break;
+
+        default:
+            avoidingObstacle = false;
+            break;
     }
-  }
 }
-// ========== 4. 随机模式控制 ==========
+}
+
+// 随机动作状态机
+if (randomActive) {
+    switch (randomStep) {
+        case 1: // 动作进行中
+            if (millis() - randomActionTime >= randomT1) {
+                motorWifi(0); // 停止电机
+                randomActionTime = millis();
+                randomStep = 2;
+            }
+            break;
+        case 2: // 停顿中
+            if (millis() - randomActionTime >= randomT2) {
+                randomRepeat--;
+                if (randomRepeat > 0) {
+                    // 继续下一个循环
+                    motorWifi(randomCmd);
+                    randomActionTime = millis();
+                    randomStep = 1;
+                } else {
+                    randomActive = false; // 完成
+                    if (randomCmd == 3 || randomCmd == 4) {
+                       uint16_t currentDist = getDistance();
+                       if (currentDist > ABNORMAL_THRESHOLD) {
+                           Serial.println("转向后面向悬崖，开始边缘逃避旋转");
+                           seekingSafeDir = true;
+                           safeSeekStep = 0;
+                           safeSeekState = 0;// 确保从旋转阶段开始
+                           motorWifi(4); // 开始右转
+                           safeSeekStartTime = millis();
+                        }
+                    }        
+                }
+            }
+            break;
+        default:
+            randomActive = false;
+            break;
+    }
+}
+
+// 边缘逃避状态机
+if (seekingSafeDir) {
+    switch (safeSeekState) {
+        case 0: // 旋转中
+            if (millis() - safeSeekStartTime >= SAFE_ROTATE_TIME) {
+                motorWifi(0);
+                safeSeekStartTime = millis();
+                safeSeekState = 1; // 进入检测
+            }
+            break;
+        case 1: // 检测中（停顿）
+            if (millis() - safeSeekStartTime >= 100) { // 停顿100ms
+                uint16_t currentDist = getDistance();
+                if (currentDist <= ABNORMAL_THRESHOLD) {
+                    // 找到安全方向
+                    Serial.println("边缘逃避成功");
+                    seekingSafeDir = false;
+                    safeSeekState = 0;
+                    safeSeekStep = 0;   // 重置步数
+                } else {
+                    safeSeekStep++;
+                    if (safeSeekStep >= SAFE_SEEK_STEPS) {
+                        // 旋转超时，进入睡眠
+                        Serial.println("边缘逃避失败，进入睡眠");
+                        roboEyes.anim_confused();
+                        roboEyes.setMood(TIRED);
+                        randomMode = RANDOM_OFF;
+                        sleepByObstacle = false;
+                        motorWifi(0);
+                        sendSleepMultiple(3);  // 播放3次help
+                        Serial.println("HELP 已发送");                 // 添加日志输出确认发送
+                        seekingSafeDir = false;
+                        safeSeekState = 0;
+                    } else {
+                        // 继续旋转
+                        motorWifi(4); // 继续右转
+                        safeSeekStartTime = millis();
+                        safeSeekState = 0; // 回到旋转
+                    }
+                }
+            }
+            break;
+    }
+}
+
+// ========== 4. 随机模式控制（非阻塞） ==========
 static unsigned long lastTick = 0;
-if (!manualActive && !voiceActionActive && millis() - lastTick > 40) {
+if (!manualActive && !voiceActionActive && !randomActive && millis() - lastTick > 40) {
     lastTick = millis();
 
-    // 定义允许的动作列表（左转、右转、前进）
-    const byte allowedMoves[] = {1, 2, 4};
+    // 定义允许的动作列表（前进、左转、右转）
+    const byte allowedMoves[] = {1, 3, 4};
     const int moveCount = 3;
 
     if (randomMode == RANDOM_SOFT) {
         if (random(120) == 1) {
-            byte cmd = allowedMoves[random(moveCount)];
-            int t1_val = random(6, 18);
-            int t2_val = random(40, 90);
-            int Time_val = 1; // 柔和模式固定循环1次
-            // 打印参数
-            Serial.print("随机动作: cmd="); Serial.print(cmd);
-            Serial.print(" t1="); Serial.print(t1_val);
-            Serial.print(" t2="); Serial.print(t2_val);
-            Serial.print(" Time="); Serial.println(Time_val);
-            // 执行动作
-            MOTOR(cmd, t1_val, t2_val, Time_val);
+            randomCmd = allowedMoves[random(moveCount)];
+            randomT1 = random(6, 18);
+            randomT2 = random(40, 90);
+            randomRepeat = 1; // 柔和模式固定循环1次
+            Serial.print("随机动作启动: cmd="); Serial.print(randomCmd);
+            Serial.print(" t1="); Serial.print(randomT1);
+            Serial.print(" t2="); Serial.print(randomT2);
+            Serial.print(" repeat="); Serial.println(randomRepeat);
+            randomActive = true;
+            randomStep = 1; // 进入动作阶段
+            motorWifi(randomCmd); // 开始动作
+            randomActionTime = millis();
         }
     }
     else if (randomMode == RANDOM_NORMAL) {
         if (random(100) == 1) {
-            byte cmd = allowedMoves[random(moveCount)];
-            int t1_val = random(5, 50);
-            int t2_val = random(10, 100);
-            int Time_val = random(20);
-            // 打印参数
-            Serial.print("随机动作: cmd="); Serial.print(cmd);
-            Serial.print(" t1="); Serial.print(t1_val);
-            Serial.print(" t2="); Serial.print(t2_val);
-            Serial.print(" Time="); Serial.println(Time_val);
-            // 执行动作
-            MOTOR(cmd, t1_val, t2_val, Time_val);
+            randomCmd = allowedMoves[random(moveCount)];
+            randomT1 = random(5, 50);
+            randomT2 = random(10, 100);
+            randomRepeat = random(20);
+            Serial.print("随机动作启动: cmd="); Serial.print(randomCmd);
+            Serial.print(" t1="); Serial.print(randomT1);
+            Serial.print(" t2="); Serial.print(randomT2);
+            Serial.print(" repeat="); Serial.println(randomRepeat);
+            randomActive = true;
+            randomStep = 1;
+            motorWifi(randomCmd);
+            randomActionTime = millis();
         }
     }
 }
@@ -1509,4 +1767,24 @@ if (!manualActive && !voiceActionActive && millis() - lastTick > 40) {
     Serial.print("测试距离: ");
     Serial.println(d);
   }
+}
+void wakeupFromSleep() {
+    if (randomMode == RANDOM_OFF) {
+        randomMode = RANDOM_NORMAL;   // 恢复到好奇模式（可根据需要改为柔和模式）
+        sleepByObstacle = false;       // 清除避障睡眠标志
+        // 恢复自动眨眼和空闲模式（参数与初始化一致）
+        roboEyes.setAutoblinker(ON, 3, 2);
+        roboEyes.setIdleMode(ON, 2, 2);
+        // 睁眼，关闭汗水，恢复默认表情
+        roboEyes.open();
+        roboEyes.setSweat(false);
+        roboEyes.setMood(DEFAULT);     // 恢复默认表情
+        Serial.println("手动唤醒");
+    }
+}
+void sendSleepMultiple(int times) {
+    for (int i = 0; i < times; i++) {
+        ASRSerial.print("HELP");
+        delay(250);  // 每次间隔250ms，可根据需要调整
+    }
 }
