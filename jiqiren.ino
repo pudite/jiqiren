@@ -2,8 +2,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Wire.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_GFX.h>
+#include <U8g2lib.h>
 #include <FluxGarage_RoboEyes.h>
 #include <Adafruit_VL53L0X.h>
 // RoboEyes.h 定义了 N 和 E 宏，与 mbedtls/ArduinoJson 冲突，需要取消定义
@@ -197,179 +196,83 @@ SequenceState singState = {0, 0, 0, false, false};
 #define OLED_SCL 9
 #define OLED_ADDR 0x3C
 
-// Adafruit_SSD1306 驱动，稳定支持 ESP32-C3
-Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-// 中文位图 12x12 像素
-#define CHAR_W 12
-#define CHAR_H 12
-typedef struct { uint16_t code; const unsigned char* bitmap; } CharBitmap;
-
-// Adafruit GFX 12x12 Chinese character bitmaps
-// Horizontal scan, MSB first, 1 bit per pixel, 24 bytes each
-static const unsigned char char_未[] = { 0x02,0x00,0x02,0x00,0x3F,0xE0,0x02,0x00,0x02,0x00,0x7F,0xF0,0x07,0x00,0x0A,0x80,0x32,0x40,0x42,0x30,0x02,0x00,0x00,0x00 };
-static const unsigned char char_连[] = { 0x42,0x00,0x22,0x00,0x3F,0xE0,0x04,0x00,0xE9,0x00,0x2F,0xE0,0x21,0x00,0x2F,0xE0,0x21,0x00,0x71,0x00,0x9F,0xE0,0x00,0x00 };
-static const unsigned char char_接[] = { 0x21,0x80,0x27,0xF0,0xFA,0x20,0x22,0x40,0x2F,0xF0,0x31,0x00,0xEF,0xF0,0x24,0x20,0x23,0x40,0x21,0xE0,0xEE,0x10,0x00,0x00 };
-static const unsigned char char_同[] = { 0x3F,0xF0,0x20,0x10,0x20,0x10,0x2F,0xF0,0x20,0x10,0x27,0xD0,0x24,0x50,0x24,0x50,0x27,0xD0,0x24,0x10,0x20,0x70,0x00,0x00 };
-static const unsigned char char_步[] = { 0x02,0x00,0x22,0x00,0x23,0xE0,0x22,0x00,0xFF,0xF0,0x02,0x00,0x12,0x20,0x62,0xC0,0x83,0x80,0x1E,0x00,0xE0,0x00,0x00,0x00 };
-static const unsigned char char_中[] = { 0x01,0x00,0x01,0x00,0x3F,0xF0,0x21,0x10,0x21,0x10,0x21,0x10,0x3F,0xF0,0x21,0x10,0x01,0x00,0x01,0x00,0x01,0x00,0x00,0x00 };
-static const unsigned char char_桌[] = { 0x02,0x00,0x03,0xF0,0x02,0x00,0x3F,0xE0,0x20,0x20,0x3F,0xE0,0x20,0x20,0x3F,0xE0,0x02,0x00,0x7F,0xF0,0x0A,0x80,0x72,0x70 };
-static const unsigned char char_面[] = { 0xFF,0xF0,0x04,0x00,0x7F,0xE0,0x49,0x20,0x4F,0x20,0x49,0x20,0x49,0x20,0x4F,0x20,0x49,0x20,0x7F,0xE0,0x40,0x20,0x00,0x00 };
-static const unsigned char char_机[] = { 0x27,0xC0,0x24,0x40,0xF4,0x40,0x24,0x40,0x74,0x40,0x6C,0x40,0xA4,0x40,0xA4,0x50,0x28,0x50,0x28,0x50,0x30,0x70,0x00,0x00 };
-static const unsigned char char_器[] = { 0x79,0xE0,0x49,0x20,0x79,0xE0,0x02,0xC0,0xFF,0xF0,0x0D,0x80,0xF0,0x70,0x79,0xE0,0x49,0x20,0x79,0xE0,0x49,0x20,0x00,0x00 };
-static const unsigned char char_人[] = { 0x02,0x00,0x02,0x00,0x02,0x00,0x02,0x00,0x06,0x00,0x05,0x00,0x0D,0x00,0x08,0x80,0x10,0xC0,0x30,0x60,0x40,0x30,0x00,0x00 };
-static const unsigned char char_启[] = { 0x06,0x00,0x7F,0xE0,0x40,0x20,0x40,0x20,0x7F,0xE0,0x40,0x00,0x5F,0xE0,0x50,0x20,0x50,0x20,0x9F,0xE0,0x90,0x20,0x00,0x00 };
-static const unsigned char char_动[] = { 0x01,0x00,0x79,0x00,0x07,0xE0,0x01,0x20,0xFD,0x20,0x21,0x20,0x49,0x20,0x4A,0x20,0x9E,0x20,0xE4,0x20,0x08,0xE0,0x00,0x00 };
-static const unsigned char char_设[] = { 0x47,0xE0,0x24,0x20,0x1C,0x20,0x18,0x30,0xE0,0x00,0x2F,0xE0,0x24,0x20,0x22,0x40,0x31,0x80,0x46,0xC0,0x18,0x30,0x00,0x00 };
-static const unsigned char char_备[] = { 0x18,0x00,0x3F,0xC0,0xD0,0x80,0x0F,0x00,0xF0,0xF0,0x3F,0xC0,0x22,0x40,0x3F,0xC0,0x22,0x40,0x3F,0xC0,0x20,0x40,0x00,0x00 };
-static const unsigned char char_天[] = { 0x7F,0xC0,0x04,0x00,0x04,0x00,0x04,0x00,0xFF,0xE0,0x04,0x00,0x0C,0x00,0x0A,0x00,0x11,0x00,0x60,0x80,0xC0,0x60,0x00,0x00 };
-static const unsigned char char_气[] = { 0x10,0x00,0x3F,0xE0,0x20,0x00,0x5F,0xE0,0xC0,0x00,0xFF,0xC0,0x00,0x40,0x00,0x40,0x00,0x50,0x00,0x50,0x00,0x30,0x00,0x00 };
-static const unsigned char char_阴[] = { 0x3D,0xF0,0x25,0x10,0x29,0x10,0x29,0xF0,0x29,0x10,0x25,0x10,0x25,0xF0,0x25,0x10,0x3F,0x10,0x22,0x10,0x24,0x70,0x00,0x00 };
-static const unsigned char char_晴[] = { 0x00,0x80,0x77,0xF0,0x50,0x80,0x57,0xE0,0x70,0x80,0x5F,0xF0,0x54,0x20,0x57,0xE0,0x74,0x20,0x54,0x20,0x04,0xE0,0x00,0x00 };
-static const unsigned char char_雨[] = { 0xFF,0xF0,0x04,0x00,0x7F,0xE0,0x44,0x20,0x75,0xA0,0x4C,0x60,0x44,0x20,0x77,0x20,0x5C,0xA0,0x44,0x20,0x45,0xE0,0x00,0x00 };
-static const unsigned char char_雪[] = { 0x3F,0xE0,0x02,0x00,0x7F,0xF0,0x42,0x10,0x1A,0xC0,0x00,0x00,0x3F,0xE0,0x00,0x20,0x3F,0xE0,0x00,0x20,0x7F,0xE0,0x00,0x00 };
-static const unsigned char char_雾[] = { 0x3F,0xE0,0x02,0x00,0x7F,0xF0,0x42,0x10,0x1F,0xE0,0x68,0xC0,0x0F,0x80,0x74,0x70,0x3F,0xE0,0x0C,0x20,0x71,0xE0,0x00,0x00 };
-static const unsigned char char_雷[] = { 0x3F,0xE0,0x02,0x00,0x7F,0xF0,0x42,0x10,0x5A,0xD0,0x02,0x00,0x3F,0xE0,0x22,0x20,0x3F,0xE0,0x22,0x20,0x3F,0xE0,0x00,0x00 };
-static const unsigned char char_阵[] = { 0x79,0x00,0x49,0x00,0x57,0xF0,0x52,0x00,0x54,0x80,0x57,0xF0,0x48,0x80,0x4F,0xF0,0x70,0x80,0x40,0x80,0x40,0x80,0x00,0x00 };
-static const unsigned char char_风[] = { 0x7F,0xC0,0x40,0x40,0x51,0x40,0x4A,0x40,0x4A,0x40,0x44,0x40,0x4C,0x40,0x4A,0x40,0x52,0x50,0xA1,0x50,0x80,0x30,0x00,0x00 };
-static const unsigned char char_转[] = { 0x21,0x00,0x21,0x00,0xFF,0xF0,0x41,0x00,0x67,0xF0,0xA2,0x00,0xFB,0xE0,0x20,0x60,0xFE,0x40,0x21,0x80,0x20,0x40,0x00,0x00 };
-static const unsigned char char_小[] = { 0x02,0x00,0x02,0x00,0x02,0x00,0x12,0x80,0x22,0x40,0x22,0x60,0x42,0x20,0x82,0x10,0x02,0x00,0x02,0x00,0x1E,0x00,0x00,0x00 };
-static const unsigned char char_大[] = { 0x04,0x00,0x04,0x00,0x04,0x00,0xFF,0xE0,0x04,0x00,0x04,0x00,0x0A,0x00,0x0A,0x00,0x11,0x00,0x60,0x80,0xC0,0x60,0x00,0x00 };
-static const unsigned char char_多[] = { 0x01,0x00,0x07,0xE0,0x08,0x40,0x34,0x80,0x07,0x00,0x0C,0x80,0x33,0xF0,0x06,0x20,0x1A,0xC0,0x03,0x00,0x3C,0x00,0x00,0x00 };
-static const unsigned char char_云[] = { 0x3F,0xE0,0x00,0x00,0x00,0x00,0x00,0x00,0x7F,0xF0,0x04,0x00,0x08,0x00,0x09,0x00,0x10,0x80,0x13,0xC0,0x3C,0x20,0x00,0x00 };
-
-// 中文位图查找表
-static const CharBitmap chineseChars[] = {
-  { 0x672A, char_未 }, { 0x8FDE, char_连 }, { 0x63A5, char_接 }, { 0x540C, char_同 },
-  { 0x6B65, char_步 }, { 0x4E2D, char_中 }, { 0x684C, char_桌 }, { 0x9762, char_面 },
-  { 0x673A, char_机 }, { 0x5668, char_器 }, { 0x4EBA, char_人 }, { 0x542F, char_启 },
-  { 0x52A8, char_动 }, { 0x8BBE, char_设 }, { 0x5907, char_备 }, { 0x5929, char_天 },
-  { 0x6C14, char_气 }, { 0x9634, char_阴 }, { 0x6674, char_晴 }, { 0x96E8, char_雨 },
-  { 0x96EA, char_雪 }, { 0x96FE, char_雾 }, { 0x96F7, char_雷 }, { 0x9635, char_阵 },
-  { 0x98CE, char_风 }, { 0x8F6C, char_转 }, { 0x5C0F, char_小 }, { 0x5927, char_大 },
-  { 0x591A, char_多 }, { 0x4E91, char_云 },
-};
-static const int chineseCharCount = sizeof(chineseChars) / sizeof(CharBitmap);
+// U8g2 统一显示驱动（替代 Adafruit_SSD1306）
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 
 class OledDisplayWrapper {
 public:
-  Adafruit_SSD1306& oled_dev;
+  U8G2& u8g2_dev;
 
-  OledDisplayWrapper() : oled_dev(oled) {}
+  OledDisplayWrapper() : u8g2_dev(u8g2) {}
 
   bool begin(uint8_t addr = 0x3C, bool reset = true) {
     Wire.begin(OLED_SDA, OLED_SCL);
     Wire.setClock(400000);
-    return oled_dev.begin(SSD1306_SWITCHCAPVCC, addr);
+    u8g2_dev.setI2CAddress(addr * 2); // 7-bit to 8-bit
+    bool result = u8g2_dev.begin();
+    u8g2_dev.enableUTF8Print();
+    u8g2_dev.setFont(u8g2_font_6x10_tf); // 默认字体，防止 print() 时空指针崩溃
+    return result;
   }
 
-  void clearDisplay()        { oled_dev.clearDisplay(); }
-  void setCursor(int16_t x, int16_t y) { oled_dev.setCursor(x, y); }
-  void setTextSize(uint8_t s)  { oled_dev.setTextSize(s); }
-  void setTextColor(uint16_t c){ oled_dev.setTextColor(c); }
-  size_t print(const char* s)  { return oled_dev.print(s); }
-  size_t print(const String& s){ return oled_dev.print(s); }
-  template<typename T> size_t print(T v) { return oled_dev.print(v); }
-  template<typename T> size_t println(T v) { return oled_dev.println(v); }
-  size_t println() { return oled_dev.println(); }
-  void display()               { oled_dev.display(); }
-  void drawPixel(int16_t x, int16_t y, uint16_t color) { oled_dev.drawPixel(x, y, color); }
-  void drawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color = 1) { oled_dev.drawLine(x0, y0, x1, y1, color); }
-  void drawCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color = 1) { oled_dev.drawCircle(x0, y0, r, color); }
-  void fillCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color = 1) { oled_dev.fillCircle(x0, y0, r, color); }
-  void fillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t color = 1) { oled_dev.fillRoundRect(x, y, w, h, r, color); }
-  void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color = 1) { oled_dev.fillRect(x, y, w, h, color); }
-  void fillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t color = 1) { oled_dev.fillTriangle(x0, y0, x1, y1, x2, y2, color); }
+  void clearDisplay()        { u8g2_dev.clearBuffer(); u8g2_dev.setDrawColor(1); }
+  void setCursor(int16_t x, int16_t y) { u8g2_dev.setCursor(x, y); }
+  void setTextSize(uint8_t s)  { /* U8g2 uses setFont for sizing; map sizes approximately */
+    if (s == 1) u8g2_dev.setFont(u8g2_font_6x10_tf);
+    else if (s >= 2) u8g2_dev.setFont(u8g2_font_logisoso24_tr);
+  }
+  void setTextColor(uint16_t c){ u8g2_dev.setDrawColor(c); }
+  size_t print(const char* s)  { return u8g2_dev.print(s); }
+  size_t print(const String& s){ return u8g2_dev.print(s); }
+  template<typename T> size_t print(T v) { return u8g2_dev.print(v); }
+  template<typename T> size_t println(T v) { return u8g2_dev.println(v); }
+  size_t println() { return u8g2_dev.println(); }
+  void display()               { u8g2_dev.sendBuffer(); }
+  void drawPixel(int16_t x, int16_t y, uint16_t color) { u8g2_dev.setDrawColor(color); u8g2_dev.drawPixel(x, y); }
+  void drawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color = 1) { u8g2_dev.setDrawColor(color); u8g2_dev.drawLine(x0, y0, x1, y1); }
+  void drawCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color = 1) { u8g2_dev.setDrawColor(color); u8g2_dev.drawCircle(x0, y0, r); }
+  void fillCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color = 1) { u8g2_dev.setDrawColor(color); u8g2_dev.drawDisc(x0, y0, r); }
+  void fillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t color = 1) {
+    // U8g2 drawRBox 参数为 uint16_t，负值/下溢会导致图形异常
+    // roboEyes 眨眼时 h 可接近0且 r>h/2，无符号减法 hh=h-r-r 会下溢为巨大值
+    u8g2_dev.setDrawColor(color);
+    if (w <= 0 || h <= 0) return;
+    if (r < 0) r = 0;
+    // 圆角半径不能超过宽高的一半，否则 U8g2 内部无符号减法下溢
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    if (x < 0 || y < 0) {
+      // 负坐标：用 drawBox 替代，避免传负值给 U8g2
+      u8g2_dev.drawBox(x < 0 ? 0 : x, y < 0 ? 0 : y, w, h);
+      return;
+    }
+    u8g2_dev.drawRBox(x, y, w, h, r);
+  }
+  void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color = 1) { u8g2_dev.setDrawColor(color); u8g2_dev.drawBox(x, y, w, h); }
+  void fillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t color = 1) {
+    // U8g2 drawTriangle 只画边框，需手动扫描线填充
+    u8g2_dev.setDrawColor(color);
+    if (y0 > y1) { int16_t t; t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t; }
+    if (y1 > y2) { int16_t t; t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t; }
+    if (y0 > y1) { int16_t t; t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t; }
+    if (y0 == y2) {
+      int16_t mn = x0, mx = x0;
+      if (x1 < mn) mn = x1; if (x1 > mx) mx = x1;
+      if (x2 < mn) mn = x2; if (x2 > mx) mx = x2;
+      u8g2_dev.drawHLine(mn, y0, mx - mn + 1);
+      return;
+    }
+    for (int16_t y = y0; y <= y2; y++) {
+      int16_t xa = (y2 != y0) ? x0 + (int32_t)(x2 - x0) * (y - y0) / (y2 - y0) : x0;
+      int16_t xb;
+      if (y <= y1) xb = (y1 != y0) ? x0 + (int32_t)(x1 - x0) * (y - y0) / (y1 - y0) : (y == y0 ? x0 : x1);
+      else xb = (y2 != y1) ? x1 + (int32_t)(x2 - x1) * (y - y1) / (y2 - y1) : x1;
+      if (xa > xb) { int16_t t = xa; xa = xb; xb = t; }
+      u8g2_dev.drawHLine(xa, y, xb - xa + 1);
+    }
+  }
   int16_t width()  { return SCREEN_WIDTH; }
   int16_t height() { return SCREEN_HEIGHT; }
-
-  // 绘制中文字符（12x12）
-  void drawChineseChar(uint16_t code, int16_t x, int16_t y, int16_t size = 1) {
-    const unsigned char* bmp = nullptr;
-    for (int i = 0; i < chineseCharCount; i++) {
-      if (chineseChars[i].code == code) { bmp = chineseChars[i].bitmap; break; }
-    }
-    if (!bmp) return;
-    oled_dev.drawBitmap(x, y, bmp, CHAR_W, CHAR_H, WHITE);
-  }
-
-  // 绘制中英混合文本
-  void drawText(const char* text, int16_t x, int16_t y, int16_t fontSize = 1) {
-    int16_t cx = x;
-    int i = 0;
-    while (text[i]) {
-      uint8_t c = (uint8_t)text[i];
-      if (c >= 0x80) {
-        if (i + 2 < strlen(text)) {
-          uint8_t b1 = c & 0x0F;
-          uint8_t b2 = text[i+1];
-          uint8_t b3 = text[i+2];
-          uint16_t code = ((uint16_t)b1 << 12) | ((uint16_t)(b2 & 0x3F) << 6) | (b3 & 0x3F);
-          bool found = false;
-          for (int j = 0; j < chineseCharCount; j++) {
-            if (chineseChars[j].code == code) {
-              oled_dev.drawBitmap(cx, y, chineseChars[j].bitmap, CHAR_W, CHAR_H, WHITE);
-              cx += CHAR_W + 2;
-              i += 3;
-              found = true;
-              break;
-            }
-          }
-          if (!found) {
-            // 未找到的字符视为空格
-            cx += CHAR_W + 2;
-            i += 3;
-          }
-        } else { break; }
-      } else {
-        oled_dev.setTextSize(fontSize);
-        oled_dev.setCursor(cx, y + 4);
-        char s[2] = { c, 0 };
-        oled_dev.print(s);
-        cx += fontSize * 6;
-        i++;
-      }
-    }
-  }
-
-  // 纯中文文本绘制（用于天气描述等）
-  void drawChineseText(const char* text, int16_t x, int16_t y) {
-    int16_t cx = x;
-    int i = 0;
-    while (text[i]) {
-      uint8_t c = (uint8_t)text[i];
-      if (c >= 0x80 && i + 2 < strlen(text)) {
-        uint8_t b1 = c & 0x0F;
-        uint8_t b2 = text[i+1];
-        uint8_t b3 = text[i+2];
-        uint16_t code = ((uint16_t)b1 << 12) | ((uint16_t)(b2 & 0x3F) << 6) | (b3 & 0x3F);
-        bool found = false;
-        for (int j = 0; j < chineseCharCount; j++) {
-          if (chineseChars[j].code == code) {
-            oled_dev.drawBitmap(cx, y, chineseChars[j].bitmap, CHAR_W, CHAR_H, WHITE);
-            cx += CHAR_W + 2;
-            i += 3;
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          // 未找到的字符视为空格（标点等）
-          cx += CHAR_W + 2;
-          i += 3;
-        }
-      } else if (c >= 0x80) {
-        i++; // skip incomplete UTF-8
-      } else {
-        oled_dev.setTextSize(1);
-        oled_dev.setCursor(cx, y + 4);
-        char s[2] = { c, 0 };
-        oled_dev.print(s);
-        cx += 6;
-        i++;
-      }
-    }
-  }
 };
 
 OledDisplayWrapper display;
@@ -421,6 +324,7 @@ char weatherApiKey[65] = "";
 char weatherCity[33] = "Beijing";
 
 bool routerConnected = false;
+bool clockModeInitialized = false;  // 标记时间模式是否已初始化WiFi连接
 bool timeSynced = false;
 struct tm timeinfo;
 char timeStr[16] = "00:00:00";
@@ -457,222 +361,65 @@ bool getTime() {
 }
 
 void updateClockDisplay() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+
   if (!getTime()) {
     timeSynced = false;
-    display.clearDisplay();
-    oled.setTextSize(1);
-    oled.setTextColor(WHITE);
-    oled.setCursor(0, 14);
-    oled.print("Time --:--:--");
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.setCursor(0, 14);
+    u8g2.print("Time --:--:--");
     if (!routerConnected) {
-      oled.setCursor(0, 30);
-      oled.print("WiFi: not connected");
+      u8g2.setCursor(0, 30);
+      u8g2.print("WiFi: not connected");
     } else {
-      oled.setCursor(0, 30);
-      oled.print("Syncing time...");
+      u8g2.setCursor(0, 30);
+      u8g2.print("Syncing time...");
     }
-    display.display();
+    u8g2.sendBuffer();
     return;
   }
   timeSynced = true;
 
-  display.clearDisplay();
+  const char* cityName = (strlen(weatherCity) > 0) ? weatherCity : ((strlen(detectedCity) > 0) ? detectedCity : "");
+  bool hasWeather = (strlen(weatherDesc) > 0);
+  bool hasCity = (strlen(weatherCity) > 0 || strlen(detectedCity) > 0);
 
-  // 时间 - 大字 (24pt)
-  oled.setTextSize(2);
-  oled.setTextColor(WHITE);
-  oled.setCursor(10, 8);
-  oled.print(timeStr);
+  // --- 时间（大字） ---
+  u8g2.setFont(u8g2_font_logisoso24_tr);
+  u8g2.setCursor(8, 26);
+  u8g2.print(timeStr);
 
-  // 日期
-  oled.setTextSize(1);
-  oled.setCursor(0, 40);
-  oled.print(dateStr);
+  // --- 日期 ---
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.setCursor(0, 38);
+  u8g2.print(dateStr);
 
-  // 城市 + 天气
-  if (strlen(weatherDesc) > 0) {
-    char buf[48];
-    const char* cityName = (strlen(weatherCity) > 0) ? weatherCity : ((strlen(detectedCity) > 0) ? detectedCity : "");
-    snprintf(buf, sizeof(buf), "%s %.1fC", cityName, currentTemp);
-    oled.setCursor(0, 52);
-    oled.print(buf);
-    // 天气描述用中文位图
-    display.drawChineseText(weatherDesc, 80, 52);
-  } else if (strlen(weatherCity) > 0) {
-    oled.setCursor(0, 52);
-    oled.print(weatherCity);
-  } else if (strlen(detectedCity) > 0) {
-    oled.setCursor(0, 52);
-    oled.print(detectedCity);
+  // --- 城市 + 温度 ---
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.setCursor(0, 48);
+  if (hasCity || hasWeather) {
+    u8g2.print(cityName);
+    if (hasWeather) {
+      u8g2.print(" ");
+      u8g2.print(currentTemp, 1);
+      u8g2.print("°C");
+    }
   }
 
-  // 底部状态
-  if (!routerConnected) {
-    oled.setCursor(0, 0);
-    oled.print("WiFi: no connection");
-  } else if (!timeSynced) {
-    oled.setCursor(0, 0);
-    oled.print("Time: syncing...");
-  } else if (locationDetected && strlen(weatherDesc) == 0) {
-    oled.setCursor(0, 0);
-    oled.print("Weather: fetching...");
+  // --- 天气描述 - U8g2 中文直接显示 ---
+  if (hasWeather) {
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2.setCursor(0, 63);
+    u8g2.print(weatherDesc);
   }
 
-  display.display();
+  u8g2.sendBuffer();
 }
 
 void detectLocation() {
-  if (!routerConnected) {
-    Serial.println("IP定位跳过: 路由器未连接");
-    return;
-  }
-
-  Serial.println("开始IP定位...");
-
-  // 使用 WiFiClient 直连IP地址，绕过APSTA模式下的DNS问题
-  // ipinfo.io 的IP: 76.76.21.21 (Cloudflare托管)
-  // ip-api.com 的IP: 93.184.216.119
-  const char* ipHost = "76.76.21.21";
-  const int ipPort = 80;
-  const char* httpHost = "ipinfo.io";
-
-  WiFiClient client;
-  client.setTimeout(8000);
-
-  Serial.print("尝试连接 ipinfo.io (");
-  Serial.print(ipHost);
-  Serial.println(")...");
-
-  if (client.connect(ipHost, ipPort)) {
-    Serial.println("TCP连接成功");
-    client.println("GET /json HTTP/1.1");
-    client.print("Host: ");
-    client.println(httpHost);
-    client.println("Connection: close");
-    client.println();
-
-    // 等待响应
-    unsigned long timeout = millis();
-    while (!client.available() && millis() - timeout < 8000) {
-      delay(10);
-    }
-
-    String payload = "";
-    while (client.available()) {
-      payload += client.readStringUntil('\n');
-    }
-    client.stop();
-
-    Serial.print("IP返回: ");
-    Serial.println(payload);
-
-    // 跳过HTTP头，找JSON体
-    int jsonStart = payload.indexOf('{');
-    if (jsonStart >= 0) {
-      String jsonBody = payload.substring(jsonStart);
-      StaticJsonDocument<256> doc;
-      DeserializationError error = deserializeJson(doc, jsonBody);
-      if (!error) {
-        const char* loc = doc["loc"].as<const char*>();
-        if (loc && strlen(loc) > 0) {
-          String locStr = String(loc);
-          int commaPos = locStr.indexOf(',');
-          if (commaPos > 0) {
-            detectedLat = locStr.substring(0, commaPos).toFloat();
-            detectedLon = locStr.substring(commaPos + 1).toFloat();
-          }
-        }
-        const char* c = doc["city"].as<const char*>();
-        if (c && strlen(c) > 0) {
-          strncpy(detectedCity, c, sizeof(detectedCity) - 1);
-          if (strlen(weatherCity) == 0) {
-            strncpy(weatherCity, c, sizeof(weatherCity) - 1);
-            Serial.print("IP定位获取城市: ");
-            Serial.println(weatherCity);
-          }
-        }
-        locationDetected = true;
-        Serial.print("IP定位成功: lat=");
-        Serial.print(detectedLat, 4);
-        Serial.print(", lon=");
-        Serial.print(detectedLon, 4);
-        Serial.print(", city=");
-        Serial.println(detectedCity);
-        return;
-      } else {
-        Serial.print("JSON解析失败: ");
-        Serial.println(error.f_str());
-      }
-    }
-  } else {
-    Serial.println("TCP连接ipinfo.io失败");
-  }
-
-  // 备用: ip-api.com 直连IP
-  const char* ipHost2 = "93.184.216.119";
-  const char* httpHost2 = "ip-api.com";
-
-  WiFiClient client2;
-  client2.setTimeout(8000);
-  Serial.print("尝试备用连接 ip-api.com (");
-  Serial.print(ipHost2);
-  Serial.println(")...");
-
-  if (client2.connect(ipHost2, ipPort)) {
-    Serial.println("TCP连接成功");
-    client2.println("GET /json/?fields=lat,lon,city,status,message HTTP/1.1");
-    client2.print("Host: ");
-    client2.println(httpHost2);
-    client2.println("Connection: close");
-    client2.println();
-
-    unsigned long timeout2 = millis();
-    while (!client2.available() && millis() - timeout2 < 8000) {
-      delay(10);
-    }
-
-    String payload2 = "";
-    while (client2.available()) {
-      payload2 += client2.readStringUntil('\n');
-    }
-    client2.stop();
-
-    Serial.print("备用IP返回: ");
-    Serial.println(payload2);
-
-    int jsonStart2 = payload2.indexOf('{');
-    if (jsonStart2 >= 0) {
-      String jsonBody2 = payload2.substring(jsonStart2);
-      StaticJsonDocument<256> doc;
-      DeserializationError error = deserializeJson(doc, jsonBody2);
-      if (!error && !doc["status"]) {
-        detectedLat = doc["lat"].as<float>();
-        detectedLon = doc["lon"].as<float>();
-        const char* c = doc["city"].as<const char*>();
-        if (c && strlen(c) > 0) {
-          strncpy(detectedCity, c, sizeof(detectedCity) - 1);
-          if (strlen(weatherCity) == 0) {
-            strncpy(weatherCity, c, sizeof(weatherCity) - 1);
-            Serial.print("备用IP定位获取城市: ");
-            Serial.println(weatherCity);
-          }
-        }
-        locationDetected = true;
-        Serial.print("备用IP定位成功: lat=");
-        Serial.print(detectedLat, 4);
-        Serial.print(", city=");
-        Serial.println(detectedCity);
-        return;
-      } else {
-        Serial.print("备用IP JSON解析失败: ");
-        Serial.println(error.f_str());
-      }
-    }
-  } else {
-    Serial.println("TCP连接ip-api.com失败");
-  }
-
-  Serial.println("IP定位完全失败");
+  // 已移除IP定位，直接使用用户配置的城市
+  Serial.println("IP定位已禁用，使用配置城市");
 }
 
 void fetchWeather() {
@@ -684,16 +431,15 @@ void fetchWeather() {
     Serial.println("天气获取跳过: API Key未设置");
     return;
   }
-
-  String url = "http://api.openweathermap.org/data/2.5/weather?";
-  if (strlen(weatherCity) > 0) {
-    url += "q=" + String(weatherCity);
-  } else if (locationDetected) {
-    url += "lat=" + String(detectedLat, 4) + "&lon=" + String(detectedLon, 4);
-  } else {
-    Serial.println("天气获取跳过: 无城市信息");
+  if (strlen(weatherCity) == 0) {
+    Serial.println("天气获取跳过: 未设置城市");
     return;
   }
+
+  String url = "http://api.openweathermap.org/data/2.5/weather?";
+  url += "q=" + String(weatherCity);
+  Serial.print("使用城市名获取天气: ");
+  Serial.println(weatherCity);
   url += "&appid=";
   url += weatherApiKey;
   url += "&units=metric&lang=zh_cn";
@@ -766,29 +512,47 @@ void loadConfigFromEEPROM() {
 void connectToRouter() {
   if (strlen(routerSSID) == 0) return;
 
+  wl_status_t status = WiFi.status();
+
+  // 如果已连接，直接返回
+  if (status == WL_CONNECTED) {
+    Serial.println("WiFi已连接，无需重连");
+    routerConnected = true;
+    return;
+  }
+
+  // 如果正在连接中，先断开，给一个干净的状态
+  if (status != WL_DISCONNECTED) {
+    Serial.print("WiFi状态异常(");
+    Serial.print(status);
+    Serial.println(")，先断开重连...");
+    WiFi.disconnect(true);
+    delay(500);
+  }
+
+  // 开始连接
   Serial.print("连接路由器WiFi: ");
   Serial.println(routerSSID);
   WiFi.begin(routerSSID, routerPassword);
 
+  // 等待连接
   int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 20) {
-    delay(500);
+  while (WiFi.status() != WL_CONNECTED && retry < 40) {
+    delay(250);
     Serial.print(".");
     retry++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
     routerConnected = true;
-    Serial.println("已连接路由器");
+    Serial.println("\n已连接路由器");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
-
-    // APSTA模式下等待网络栈稳定
     Serial.println("等待网络栈稳定...");
     delay(2000);
   } else {
     routerConnected = false;
-    Serial.println("路由器连接失败");
+    Serial.println("\n路由器连接失败");
   }
 }
 
@@ -1242,7 +1006,7 @@ void handleRoot() {
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>桌面机器人控制</title>
 <style>
 * {
@@ -1267,13 +1031,16 @@ body {
 }
 
 .panel {
-  width: 320px;
-  padding: 20px;
+  width: 95vw;
+  max-width: 320px;
+  padding: 15px;
   border-radius: 20px;
   background: rgba(0, 255, 225, 0.05);
   border: 1px solid rgba(0, 255, 225, 0.4);
   box-shadow: 0 0 30px rgba(0, 255, 225, 0.3);
   backdrop-filter: blur(10px);
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 h2 {
@@ -1403,9 +1170,11 @@ h2 {
 
 .config-row {
   display: flex;
-  gap: 6px;
+  gap: 4px;
   margin-bottom: 6px;
   align-items: center;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .config-row label {
@@ -1416,30 +1185,35 @@ h2 {
 
 .config-row input {
   flex: 1;
+  min-width: 0; /* 重要：防止flex子项溢出 */
   padding: 6px 8px;
   border-radius: 6px;
   border: 1px solid rgba(0, 255, 225, 0.3);
   background: rgba(0, 0, 0, 0.3);
   color: #00ffe1;
-  font-size: 11px;
+  font-size: 16px; /* 字体≥16px防止iOS自动缩放 */
+  -webkit-text-size-adjust: 100%;
+  -moz-text-size-adjust: 100%;
+  -ms-text-size-adjust: 100%;
+  touch-action: manipulation;
+  box-sizing: border-box;
 }
 
 .config-row select {
   flex: 1;
+  min-width: 0; /* 重要：防止flex子项溢出 */
   padding: 6px 8px;
   border-radius: 6px;
   border: 1px solid rgba(0, 255, 225, 0.3);
   background: rgba(0, 0, 0, 0.3);
   color: #00ffe1;
-  font-size: 11px;
-}
-
-.config-row select option {
-  background: #111;
-  color: #00ffe1;
+  font-size: 16px; /* 字体≥16px防止iOS自动缩放 */
+  -webkit-text-size-adjust: 100%;
+  box-sizing: border-box;
 }
 
 .config-row button {
+  flex-shrink: 0; /* 防止按钮被压缩 */
   padding: 6px 10px;
   border-radius: 6px;
   border: none;
@@ -1448,6 +1222,11 @@ h2 {
   font-size: 11px;
   cursor: pointer;
   white-space: nowrap;
+}
+
+.config-row select option {
+  background: #111;
+  color: #00ffe1;
 }
 
 .net-status {
@@ -1618,7 +1397,8 @@ h2 {
   </div>
   <div class="config-row">
     <label>城市</label>
-    <input type="text" id="cfg_city" placeholder="留空则自动IP定位">
+    <input type="text" id="cfg_city" placeholder="输入城市名(拼音)" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+    <button onclick="refreshWeather()" style="flex:0 0 auto;min-width:80px;padding:8px;margin-left:8px">刷新天气</button>
   </div>
   <div class="config-row">
     <button onclick="saveConfig()" style="flex:1">保存配置</button>
@@ -1787,32 +1567,63 @@ function testConnect() {
     .catch(e => { status.textContent = '连接失败'; });
 }
 
+function refreshWeather() {
+  const status = document.getElementById('netStatus');
+  status.textContent = '刷新天气中...';
+  fetch('/refreshWeather')
+    .then(r => r.text())
+    .then(t => { status.textContent = t; })
+    .catch(e => { status.textContent = '刷新失败'; });
+}
+
 // 加载配置到表单
 function loadConfig() {
   fetch('/loadConfig')
     .then(r => r.json())
     .then(d => {
-      // 设置select的选中值
       const ssidSel = document.getElementById('cfg_ssid');
+
+      // 如果有保存的SSID，确保它在下拉列表中
+      if (d.ssid && d.ssid.length > 0) {
+        let exists = false;
+        for (let i = 0; i < ssidSel.options.length; i++) {
+          if (ssidSel.options[i].value === d.ssid) {
+            exists = true;
+            break;
+          }
+        }
+        if (!exists) {
+          const opt = document.createElement('option');
+          opt.value = d.ssid;
+          opt.textContent = d.ssid + ' (已保存)';
+          ssidSel.insertBefore(opt, ssidSel.firstChild);
+        }
+      }
+
       ssidSel.value = d.ssid || '';
       document.getElementById('cfg_password').value = d.password || '';
       document.getElementById('cfg_apikey').value = d.apiKey || '';
       const cityInput = document.getElementById('cfg_city');
-      // 如果有检测到的城市且未手动填写，显示检测到的城市
-      if (d.city || d.detectedCity) {
-        cityInput.value = d.city || d.detectedCity;
+      if (d.city) {
+        cityInput.blur();
+        cityInput.value = d.city;
+        cityInput.blur();
       }
-      // 更新状态提示
+
+      // 提示是否已有配置
       const status = document.getElementById('netStatus');
       if (status) {
         let text = d.connected ? '路由器: 已连接' : '路由器: 未连接';
         if (d.connected) {
-          if (d.located && d.detectedCity) {
-            text += ' | IP定位: ' + d.detectedCity;
-          } else if (d.located) {
-            text += ' | IP已定位(无城市名)';
+          if (d.city) {
+            text += ' | 城市: ' + d.city;
           } else {
             text += ' | 天气: 需填城市';
+          }
+        } else {
+          // 未连接时提示用户填写WiFi信息
+          if (!d.ssid || d.ssid.length === 0) {
+            text += ' | 请填写WiFi信息';
           }
         }
         status.textContent = text;
@@ -1832,36 +1643,68 @@ function setMode(mode){
 // 页面加载完成后的初始化
 document.addEventListener('DOMContentLoaded', function() {
   console.log('桌面机器人控制页面已加载');
-  
+
+  // 立即移除所有输入框的焦点
+  setTimeout(function() {
+    const inputs = document.querySelectorAll('input, select');
+    inputs.forEach(function(el) {
+      el.blur();
+    });
+    window.scrollTo(0, 0);
+    document.activeElement && document.activeElement.blur();
+  }, 10);
+
   // 防止页面滚动
   document.body.addEventListener('touchmove', function(e) {
     if (e.target.classList.contains('dir-btn')) {
       e.preventDefault();
     }
   }, { passive: false });
-  
+
   // 鼠标移出窗口时停止
   document.addEventListener('mouseleave', stopCommand);
-  
+
   // 处理页面可见性变化（切换到其他标签页时停止）
   document.addEventListener('visibilitychange', function() {
     if (document.hidden) {
       stopCommand();
     }
   });
-  
+
   // 防止右键菜单
   document.addEventListener('contextmenu', function(e) {
     if (e.target.classList.contains('dir-btn')) {
       e.preventDefault();
     }
   });
-  
+
+  // 防止任何输入框自动聚焦
+  document.addEventListener('focusin', function(e) {
+    // 只有用户真正点击时才允许聚焦
+    if (!e.isTrusted) {
+      e.preventDefault();
+      e.target.blur();
+    }
+  }, true);
+
   // 定期检查模式状态（每3秒一次）
   setInterval(checkModeStatus, 3000);
 
-  // 加载配置到表单
-  loadConfig();
+  // 延迟加载配置，避免触发自动聚焦
+  setTimeout(function() {
+    loadConfig();
+    // 再次移除焦点
+    const inputs = document.querySelectorAll('input, select');
+    inputs.forEach(function(el) {
+      el.blur();
+    });
+    window.scrollTo(0, 0);
+  }, 100);
+
+  // 加载配置后自动扫描WiFi（扫描结果会补充到下拉列表，如果扫描到已保存的SSID则更新显示）
+  setTimeout(function() {
+    scanWifi();
+  }, 300);
 });
 
 // 检查模式状态
@@ -1884,12 +1727,10 @@ function checkModeStatus() {
       if (status) {
         let text = d.connected ? '路由器: 已连接' : '路由器: 未连接';
         if (d.connected) {
-          if (d.located && d.detectedCity) {
-            text += ' | IP定位: ' + d.detectedCity;
-          } else if (d.located) {
-            text += ' | 天气: 已定位';
+          if (d.city) {
+            text += ' | 城市: ' + d.city;
           } else {
-            text += ' | 天气: 定位中/需填城市';
+            text += ' | 天气: 需填城市';
           }
         }
         status.textContent = text;
@@ -1992,18 +1833,61 @@ void setupServer() {
     singState = {0, 0, 0, false, false};
     // 显示时钟
     display.clearDisplay();
-    oled.setTextSize(1);
-    oled.setTextColor(WHITE);
-    oled.setCursor(0, 14);
-    oled.print("Syncing time...");
+    display.setTextSize(1);
+    display.setTextColor(1);
+    display.setCursor(0, 14);
+
+    // 如果已经在时间模式且WiFi已连接，只刷新天气，不用重连
+    if (clockModeInitialized && routerConnected) {
+      Serial.println("时间模式：已连接，只刷新天气");
+      display.print("Refreshing...");
+      display.display();
+      fetchWeather();
+      lastWeatherFetch = millis();
+      Serial.println("切换到时间模式");
+      server.sendHeader("Content-Type", "text/plain; charset=utf-8");
+      server.send(200, "text/plain", "已刷新天气");
+      return;
+    }
+
+    display.print("Connecting WiFi...");
     display.display();
     lastClockUpdate = millis();
-    // 先定位再获取天气
-    if (routerConnected && !locationDetected) {
-      detectLocation();
+
+    // 初次进入时间模式，连接WiFi
+    Serial.println("时间模式：开始连接路由器...");
+
+    if (!clockModeInitialized) {
+      WiFi.mode(WIFI_AP_STA);
+      delay(200);
     }
-    fetchWeather();
-    lastWeatherFetch = millis();
+
+    connectToRouter();
+    if (routerConnected) {
+      if (!clockModeInitialized) {
+        initSNTP();
+      }
+      clockModeInitialized = true;
+
+      // 更新显示
+      display.clearDisplay();
+      display.setCursor(0, 14);
+      display.print("Syncing time...");
+      display.display();
+
+      // 获取天气
+      Serial.println("等待网络栈稳定...");
+      delay(1000);
+      fetchWeather();
+      lastWeatherFetch = millis();
+    } else {
+      // WiFi连接失败
+      display.clearDisplay();
+      display.setCursor(0, 14);
+      display.print("WiFi not config'd");
+      display.display();
+    }
+
     Serial.println("切换到时间模式");
     server.sendHeader("Content-Type", "text/plain; charset=utf-8");
     server.send(200, "text/plain", "已切换到时间模式");
@@ -2016,6 +1900,10 @@ void setupServer() {
     String apiKey = server.arg("apiKey");
     String city = server.arg("city");
 
+    // 检查WiFi配置是否有变化
+    bool wifiConfigChanged = (ssid != String(routerSSID) || password != String(routerPassword));
+    bool cityChanged = (city != String(weatherCity));
+
     ssid.toCharArray(routerSSID, sizeof(routerSSID));
     password.toCharArray(routerPassword, sizeof(routerPassword));
     apiKey.toCharArray(weatherApiKey, sizeof(weatherApiKey));
@@ -2023,16 +1911,49 @@ void setupServer() {
 
     saveConfigToEEPROM();
 
-    // 尝试连接路由器
-    connectToRouter();
-    if (routerConnected) {
-      initSNTP();
-      server.send(200, "text/plain", "配置已保存，路由器已连接");
-    } else if (ssid.length() > 0) {
-      server.send(200, "text/plain", "配置已保存，WiFi密码错误或信号太弱");
-    } else {
-      server.send(200, "text/plain", "配置已保存，请填写WiFi信息");
+    // 只有WiFi配置变化时才重置WiFi连接
+    if (wifiConfigChanged) {
+      Serial.println("WiFi配置已更改，重置连接");
+      clockModeInitialized = false;
+      routerConnected = false;
+      WiFi.disconnect(true);
+      delay(200);
     }
+
+    // 如果WiFi配置变化了，尝试连接
+    if (wifiConfigChanged && ssid.length() > 0) {
+      Serial.println("保存配置后测试连接...");
+      connectToRouter();
+      if (routerConnected) {
+        initSNTP();
+        // 同时刷新天气
+        fetchWeather();
+        lastWeatherFetch = millis();
+        server.send(200, "text/plain", "配置已保存！路由器已连接成功！");
+      } else {
+        server.send(200, "text/plain", "配置已保存，但路由器连接失败，请检查密码和信号");
+      }
+    } else if (cityChanged && routerConnected) {
+      // 只是城市变了，只刷新天气
+      Serial.println("城市已更改，刷新天气...");
+      fetchWeather();
+      lastWeatherFetch = millis();
+      server.send(200, "text/plain", "配置已保存！天气已刷新！");
+    } else {
+      server.send(200, "text/plain", "配置已保存");
+    }
+  });
+
+  // 刷新天气路由
+  server.on("/refreshWeather", []() {
+    if (!routerConnected) {
+      server.send(200, "text/plain", "错误：WiFi未连接");
+      return;
+    }
+    Serial.println("手动刷新天气...");
+    fetchWeather();
+    lastWeatherFetch = millis();
+    server.send(200, "text/plain", "天气已刷新");
   });
 
   // 扫描WiFi网络
@@ -2050,10 +1971,23 @@ void setupServer() {
 
   // 测试连接路由
   server.on("/testConnect", []() {
+    Serial.println("测试连接按钮被点击");
+    // 先检查是否已连接
     if (routerConnected && WiFi.status() == WL_CONNECTED) {
-      server.send(200, "text/plain", "路由器已连接 | IP: " + WiFi.localIP().toString());
+      server.send(200, "text/plain", "✓ 路由器已连接 | IP: " + WiFi.localIP().toString());
+      return;
+    }
+    // 尝试连接
+    if (strlen(routerSSID) > 0) {
+      connectToRouter();
+      if (routerConnected) {
+        initSNTP();
+        server.send(200, "text/plain", "✓ 连接成功！IP: " + WiFi.localIP().toString());
+      } else {
+        server.send(200, "text/plain", "✗ 连接失败，请检查密码和信号");
+      }
     } else {
-      server.send(200, "text/plain", "未连接路由器");
+      server.send(200, "text/plain", "请先配置WiFi名称和密码");
     }
   });
 
@@ -2305,11 +2239,8 @@ void setup() {
   // 加载EEPROM配置
   loadConfigFromEEPROM();
 
-  // 连接路由器WiFi
-  connectToRouter();
-
-  // 初始化SNTP时间同步
-  initSNTP();
+  // 注意：不再开机自动连接路由器，仅在进入时间模式时才连接
+  Serial.println("路由器连接已延迟到时间模式启动时");
 
   // 降低发射功率以提高稳定性
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
@@ -2346,7 +2277,8 @@ void setup() {
   } else {
     Serial.println("VL53L0X 初始化成功");
     sensorOK = true;
-        // 动态校准：连续读取10次距离取平均
+    Wire.setClock(400000); // 传感器初始化后，立即恢复高速 I2C 速率以保证 OLED 刷新率
+    // 动态校准：连续读取10次距离取平均
     uint32_t sumDist = 0;
     for (int i = 0; i < 10; i++) {
       sumDist += getDistance();  // 原来是 getRawDistance()
@@ -2363,6 +2295,7 @@ void setup() {
     
     // 在OLED上显示校准结果（2秒）
     display.clearDisplay();
+    display.setTextColor(1);
     display.setCursor(0, 0);
     display.print("Calibration OK");
     display.setCursor(0, 12);
@@ -2386,23 +2319,27 @@ void setup() {
 
   // 在OLED上显示WiFi信息
   display.clearDisplay();
-  oled.setTextSize(1);
-  oled.setTextColor(WHITE);
-  oled.setCursor(0, 14);
-  oled.print("WiFi AP Started");
-  oled.setCursor(0, 28);
-  oled.print("Name: Desk Robot");
+  display.setTextSize(1);
+  display.setTextColor(1);
+  display.setCursor(0, 14);
+  display.print("WiFi AP Started");
+  display.setCursor(0, 28);
+  display.print("Name: Desk Robot");
   snprintf(ipBuf, sizeof(ipBuf), "IP: %s", WiFi.softAPIP().toString().c_str());
-  oled.setCursor(0, 42);
-  oled.print(ipBuf);
+  display.setCursor(0, 42);
+  display.print(ipBuf);
   display.display();
 }
 
 /* ================= 主循环 ================= */
 void loop() {
-  // 时间模式下关闭眼睛动画，避免覆盖OLED时钟显示
   if (randomMode != RANDOM_CLOCK) {
-    roboEyes.update();
+    // 眼睛动画更新，限制帧率防止闪烁
+    static unsigned long lastEyeUpdate = 0;
+    if (millis() - lastEyeUpdate > 50) {
+      lastEyeUpdate = millis();
+      roboEyes.update();
+    }
   }
 
   // 处理客户端请求
@@ -2421,8 +2358,7 @@ void loop() {
       lastWeatherFetch = millis();
       fetchWeather();
     }
-    // 时钟模式下不执行传感器和电机逻辑
-    return;
+    return; // 时钟模式下不执行其他任何逻辑
   }
 
   // 检查并停止超时命令（安全保护）
@@ -2813,35 +2749,45 @@ else if (randomMode == RANDOM_NORMAL) {
 }
 }
 
-  // 每5秒打印一次连接状态
-  static unsigned long lastStatus = 0;
-  if (millis() - lastStatus > 5000) {
-    lastStatus = millis();
-    int stations = WiFi.softAPgetStationNum();
-    Serial.print("已连接设备数: ");
-    Serial.println(stations);
-    
-    // 在OLED上更新连接状态
-    if (stations > 0) {
-      display.clearDisplay();
-      oled.setTextSize(1);
-      oled.setTextColor(WHITE);
-      oled.setCursor(0, 14);
-      oled.print("Connected:");
-      char staBuf[16];
-      snprintf(staBuf, sizeof(staBuf), "%d devices", stations);
-      oled.setCursor(0, 30);
-      oled.print(staBuf);
-      display.display();
-    }
+// 每5秒打印一次连接状态
+static unsigned long lastStatus = 0;
+if (millis() - lastStatus > 5000) {
+  lastStatus = millis();
+  int stations = WiFi.softAPgetStationNum();
+  Serial.print("已连接设备数: ");
+  Serial.println(stations);
+
+  // 在OLED上更新连接状态（已禁用，避免干扰眼睛动画）
+  /*
+  if (stations > 0) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(1);
+    display.setCursor(0, 14);
+    display.print("Connected:");
+    char staBuf[16];
+    snprintf(staBuf, sizeof(staBuf), "%d devices", stations);
+    display.setCursor(0, 30);
+    display.print(staBuf);
+    display.display();
   }
+  */
+}
   // 每2秒读取一次距离用于测试
   static unsigned long lastTestRead = 0;
-  if (sensorOK && millis() - lastTestRead > 2000) {
+  if (sensorOK && millis() - lastTestRead > 500) { // 加速到0.5s，确保日志可见
     lastTestRead = millis();
     uint16_t d = getDistance();
-    Serial.print("测试距离: ");
-    Serial.println(d);
+    Serial.print("[LOOP] 模式: ");
+    switch(randomMode) {
+      case RANDOM_OFF: Serial.print("睡眠"); break;
+      case RANDOM_SOFT: Serial.print("轻柔"); break;
+      case RANDOM_NORMAL: Serial.print("好奇"); break;
+      case RANDOM_CLOCK: Serial.print("时钟"); break;
+    }
+    Serial.print(" | 距离: "); Serial.print(d); Serial.print(" | 前进:"); Serial.print(movingForward ? "是" : "否");
+    Serial.print(" | 手动:"); Serial.print(manualActive ? "是" : "否");
+    Serial.println(" | 滤波: " + String(latestDistance));
   }
 }
 void wakeupFromSleep() {
