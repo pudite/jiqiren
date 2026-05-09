@@ -426,9 +426,6 @@ float detectedLat = 0;
 float detectedLon = 0;
 char detectedCity[32] = "";
 char ipBuf[48] = "";
-int animFrame = 0;
-unsigned long lastAnimFrame = 0;
-
 // 时钟模式状态机
 enum ClockState {
   CLOCK_INIT,        // 刚进入时钟模式，检查配置
@@ -444,6 +441,14 @@ bool clockSessionReady = false;
 unsigned long clockConnectStartTime = 0;
 bool clockFetchStarted = false;
 unsigned long clockFetchStart = 0;
+
+// 滚动显示状态 (城市名/底部天气溢出时跑马灯)
+int cityScrollOff = 0;
+int bottomScrollOff = 0;
+unsigned long lastScrollMs = 0;
+int cityScrollDir = 1;    // 1=左滚, -1=右滚回
+int bottomScrollDir = 1;
+bool needFasterRefresh = false;
 
 // asyncSearchTask实现（需在全局变量声明之后）
 void asyncSearchTask(void* pv) {
@@ -512,48 +517,81 @@ bool getTime() {
   return true;
 }
 
-// 旋转动画绘制 - 简单宇航员
-void drawRotatingAstronaut(int cx, int cy, int frame) {
-  float angle = frame * (M_PI / 6.0f); // 12帧 = 360度，每帧30度
-  float cosA = cos(angle);
-  float sinA = sin(angle);
-
-  // 定义关键点（相对于中心）
-  // 头部圆
-  int headX = cx + (int)(0 * cosA - 8 * sinA);
-  int headY = cy + (int)(0 * sinA + 8 * cosA);
-  u8g2.drawCircle(headX, headY, 4);
-
-  // 身体线
-  int bodyTopX = cx + (int)(0 * cosA - 3 * sinA);
-  int bodyTopY = cy + (int)(0 * sinA + 3 * cosA);
-  int bodyBotX = cx + (int)(0 * cosA + 5 * sinA);
-  int bodyBotY = cy + (int)(0 * sinA - 5 * cosA);
-  u8g2.drawLine(headX, headY + 4, bodyBotX, bodyBotY);
-
-  // 手臂
-  int armLX = cx + (int)(-7 * cosA - 0 * sinA);
-  int armLY = cy + (int)(-7 * sinA + 0 * cosA);
-  int armRX = cx + (int)(7 * cosA + 0 * sinA);
-  int armRY = cy + (int)(7 * sinA - 0 * cosA);
-  u8g2.drawLine(armLX, armLY, armRX, armRY);
-
-  // 左腿
-  int legLX = cx + (int)(-4 * cosA + 10 * sinA);
-  int legLY = cy + (int)(-4 * sinA - 10 * cosA);
-  u8g2.drawLine(bodyBotX, bodyBotY, legLX, legLY);
-
-  // 右腿
-  int legRX = cx + (int)(4 * cosA + 10 * sinA);
-  int legRY = cy + (int)(4 * sinA - 10 * cosA);
-  u8g2.drawLine(bodyBotX, bodyBotY, legRX, legRY);
-}
-
 // 获取星期几的简短中文
 const char* getWeekdayCN(int wday) {
   const char* weeks[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
   if (wday >= 0 && wday <= 6) return weeks[wday];
   return "";
+}
+
+// 从完整城市名中提取简要城市名
+// "湖北省武汉市江岸区" → "江岸", "北京市朝阳区" → "朝阳", "武汉" → "武汉"
+String getShortCityName(const char* cityName) {
+  String name = String(cityName);
+  // 1) 去掉省级前缀
+  const char* prefixes[] = {"特别行政区", "自治区", "省"};
+  for (int i = 0; i < 3; i++) {
+    int pos = name.indexOf(prefixes[i]);
+    if (pos > 0) {
+      String after = name.substring(pos + strlen(prefixes[i]));
+      if (after.length() > 0) { name = after; break; }
+    }
+  }
+  // 2) 去掉尾部行政区划后缀 (注意顺序: "市"可能在中间, 后面还有"区")
+  //    对于"武汉市江岸区": 先去"区"→"武汉市江岸", 再去"市"→"江岸"
+  bool changed = true;
+  while (changed && name.length() > 3) {
+    changed = false;
+    if (name.endsWith("区")) { name = name.substring(0, name.length() - 3); changed = true; }
+    else if (name.endsWith("县")) { name = name.substring(0, name.length() - 3); changed = true; }
+    else if (name.endsWith("市")) { name = name.substring(0, name.length() - 3); changed = true; }
+    else if (name.endsWith("州")) { name = name.substring(0, name.length() - 3); changed = true; }
+  }
+  // 3) 如果还包含"市"(城市级前缀), 取最后"市"之后的部分
+  //    例如 "武汉市" → 去"市"后为空→回退; "武汉" → 无"市"→保持
+  int lastCity = name.lastIndexOf("市");
+  if (lastCity >= 0) {
+    String after = name.substring(lastCity + 3);
+    if (after.length() > 0) name = after;
+  }
+  // 4) UTF-8安全截断(最多4个中文字=12字节)
+  if (name.length() > 12) {
+    int bytes = 0; const char* s = name.c_str();
+    while (*s && bytes < 12) {
+      int clen = 1;
+      if ((*s & 0xE0) == 0xC0) clen = 2;
+      else if ((*s & 0xF0) == 0xE0) clen = 3;
+      if (bytes + clen > 12) break;
+      bytes += clen; s += clen;
+    }
+    name = name.substring(0, bytes);
+  }
+  return name;
+}
+
+// 和风天气 iconDay → U8g2 open_iconic_weather 字体码点 (基准0x40)
+// 0x40=晴 0x41=少云 0x42=多云 0x43=阴 0x44=小雨 0x45=中雨 0x46=雷雨 0x47=雪 0x48=雾
+// 和风代码: 100晴 101多云 102少云 103晴间多云 104阴
+//           200-213风  300-318雨(302-304雷阵雨)  400-407雪  500-515雾霾沙尘
+uint16_t getWeatherIconGlyph(const char* iconCode) {
+  int code = atoi(iconCode);
+  if (code == 100) return 0x40;                              // 晴 → Sunny
+  else if (code == 102) return 0x41;                          // 少云 → Partly Cloudy
+  else if (code == 101 || code == 103) return 0x42;           // 多云/晴间多云 → Cloudy
+  else if (code == 104) return 0x43;                          // 阴 → Overcast
+  else if (code >= 302 && code <= 304) return 0x46;           // 雷阵雨 → Thunderstorm
+  else if (code >= 300 && code <= 318) return 0x45;           // 雨(阵雨/小雨/中雨/大雨/暴雨) → Rain
+  else if (code >= 200 && code <= 213) return 0x46;           // 风(无专用图标,用雷雨替代)
+  else if (code >= 400 && code <= 407) return 0x47;           // 雪 → Snow
+  else if (code >= 500 && code <= 515) return 0x48;           // 雾/霾/沙尘 → Fog/Mist
+  return 0x43; // 兜底 → 阴(Overcast)
+}
+
+// 绘制天气图标 (x,y=基线, open_iconic_weather_2x 16x16)
+void drawWeatherIconGlyph(int x, int y, const char* iconCode) {
+  uint16_t glyph = getWeatherIconGlyph(iconCode);
+  u8g2.setFont(u8g2_font_open_iconic_weather_2x_t);
+  u8g2.drawGlyph(x, y, glyph);
 }
 
 void updateClockDisplay() {
@@ -593,72 +631,134 @@ void updateClockDisplay() {
     u8g2.sendBuffer(); return;
   }
 
-  // === WiFi已连接: 左边始终画时间,右边按场景变化 ===
-  u8g2.drawLine(77, 0, 77, 63);
+  // === 分割线: 上部51px(y=0-50), 下部12px(y=52-63), 左右x=77仅上部 ===
+  u8g2.drawHLine(0, 51, 128);
+  u8g2.drawLine(77, 0, 77, 50);
 
-  // 左边: 时间+日期
+  // 公用变量
   bool timeOk = getTime();
   if (timeOk) timeSynced = true;
-  char hhmm[6], dateDisplay[20];
-  if (timeOk) {
-    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
-    snprintf(dateDisplay, sizeof(dateDisplay), "%d月%d日 %s",
-             timeinfo.tm_mon + 1, timeinfo.tm_mday, getWeekdayCN(timeinfo.tm_wday));
-  } else {
-    strcpy(hhmm, "--:--");
-    strcpy(dateDisplay, "同步中...");
-  }
-  u8g2.setFont(u8g2_font_logisoso24_tr);
-  int tw = u8g2.getStrWidth(hhmm);
-  int tx = (77 - tw) / 2; if (tx < 0) tx = 2;
-  u8g2.setCursor(tx, 35); u8g2.print(hhmm);
-  u8g2.setFont(u8g2_font_wqy12_t_gb2312);
-  int dw = u8g2.getUTF8Width(dateDisplay);
-  int dx = (77 - dw) / 2; if (dx < 0) dx = 1;
-  u8g2.setCursor(dx, 62); u8g2.print(dateDisplay);
-
-  // 右边: 按状态显示
-  const char* cityName = (strlen(weatherCity) > 0) ? weatherCity : ((strlen(detectedCity) > 0) ? detectedCity : "");
+  const char* rawCity = (strlen(weatherCity) > 0) ? weatherCity : ((strlen(detectedCity) > 0) ? detectedCity : "");
+  String shortCity = (strlen(rawCity) > 0) ? getShortCityName(rawCity) : "";
   bool hasWeather = (strlen(weatherToday.textDay) > 0);
   bool hasConfig  = (strlen(weatherApiKey) > 0 && strlen(weatherLocationId) > 0);
 
+  // 滚动步进计时
+  bool scrollTick = false;
+  unsigned long nowSc = millis();
+  if (nowSc - lastScrollMs >= 250) { lastScrollMs = nowSc; scrollTick = true; }
+  needFasterRefresh = false;
+
+  // ============ 左上区 (0-76, 0-51): 大字时间 + 日期/星期 ============
+  if (timeOk) {
+    char hhmm[6];
+    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+    u8g2.setFont(u8g2_font_logisoso24_tr); // 24px, "00:00"≈60px, 77px栏内左右各8px不压线
+    int tw = u8g2.getStrWidth(hhmm);
+    int tx = (77 - tw) / 2; if (tx < 2) tx = 2;
+    u8g2.setCursor(tx, 31); u8g2.print(hhmm);
+
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    char dateShort[7];
+    snprintf(dateShort, sizeof(dateShort), "%02d-%02d", timeinfo.tm_mon + 1, timeinfo.tm_mday);
+    u8g2.setCursor(3, 46); u8g2.print(dateShort);
+    const char* wd = getWeekdayCN(timeinfo.tm_wday);
+    int ww = u8g2.getUTF8Width(wd);
+    u8g2.setCursor(74 - ww, 46); u8g2.print(wd);
+  } else {
+    u8g2.setFont(u8g2_font_logisoso24_tr);
+    int tw = u8g2.getStrWidth("--:--");
+    u8g2.setCursor((77 - tw) / 2, 31); u8g2.print("--:--");
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2.setCursor(3, 46); u8g2.print("同步中...");
+  }
+
+  // ============ 右上区 (77-127, 0-51): 五层 ============
+  // 接口间隙: 城市→实线1px 实线→图标1px 图标→虚线1px 虚线↔文字(重叠文字优先) 文字→气温交叠1px 气温→分割线1px ✓
   switch (clockState) {
   case CLOCK_LOCATING:
   case CLOCK_FETCHING:
     u8g2.setFont(u8g2_font_wqy12_t_gb2312);
-    u8g2.setCursor(82, 28); u8g2.print("获取");
-    u8g2.setCursor(82, 44); u8g2.print("天气中...");
-    for (int i = 0; i < (millis() / 500) % 4; i++) u8g2.drawDisc(90 + i * 10, 54, 2);
+    u8g2.setCursor(84, 28); u8g2.print("获取");
+    u8g2.setCursor(84, 44); u8g2.print("天气...");
     break;
 
   case CLOCK_RUNNING:
     if (hasWeather) {
-      if (strlen(cityName) > 0) {
-        int cw = u8g2.getUTF8Width(cityName); if (cw > 49) cw = 49;
-        u8g2.setCursor(78 + (49 - cw) / 2, 11); u8g2.print(cityName);
+      // --- ① 城市 (y=0-10): 基线=10, 图标下移1px居中 ---
+      if (shortCity.length() > 0) {
+        int mx = 80;
+        u8g2.drawCircle(mx + 3, 5, 3);       // ⊙ 直径7px圆圈
+        u8g2.drawDisc(mx + 3, 5, 1);         // 中心实心点
+        u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+        int cw = u8g2.getUTF8Width(shortCity.c_str());
+        int cityW = 41;
+        if (cw > cityW) {
+          needFasterRefresh = true;
+          if (scrollTick) {
+            cityScrollOff += cityScrollDir * 2;
+            if (cityScrollOff <= -(cw - cityW + 6)) cityScrollDir = 1;
+            if (cityScrollOff >= 0) cityScrollDir = -1;
+          }
+          u8g2.setCursor(89 + cityScrollOff, 10);
+        } else {
+          cityScrollOff = 0; cityScrollDir = 1;
+          u8g2.setCursor(89, 10);
+        }
+        u8g2.print(shortCity);
       }
-      char tl[32]; snprintf(tl, sizeof(tl), "今:%s %d°", weatherToday.textDay, weatherToday.tempMax);
-      int tlx = 78 + (49 - u8g2.getUTF8Width(tl)) / 2;
-      u8g2.setCursor(tlx, 23); u8g2.print(tl);
-      char ml[32]; snprintf(ml, sizeof(ml), "明:%s %d°", weatherTomorrow.textDay, weatherTomorrow.tempMax);
-      int mlx = 78 + (49 - u8g2.getUTF8Width(ml)) / 2;
-      u8g2.setCursor(mlx, 35); u8g2.print(ml);
-      u8g2.drawLine(78, 36, 127, 36);
-      if (millis() - lastAnimFrame >= 150) { lastAnimFrame = millis(); animFrame = (animFrame + 1) % 12; }
-      drawRotatingAstronaut(102, 50, animFrame);
-    } else {
-      // 有配置但天气为空
+      u8g2.drawHLine(78, 11, 49); // 实线 ①②间
+
+      // --- ②③ 天气图标 (y=12-27): drawGlyph(93,27)→y≈11-27 ---
+      drawWeatherIconGlyph(93, 27, weatherToday.iconDay);
+
+      for (int dx = 78; dx < 126; dx += 5) { u8g2.drawHLine(dx, 28, 3); } // 虚线 y=28
+
+      // --- ④ 天气文字: 基线=38, 顶≈28与虚线重叠(文字优先) ---
       u8g2.setFont(u8g2_font_wqy12_t_gb2312);
-      u8g2.setCursor(82, 22); u8g2.print(hasConfig ? "请手动" : "请设置");
-      u8g2.setCursor(82, 40); u8g2.print(hasConfig ? "重试刷新" : "相关信息");
+      int wtw = u8g2.getUTF8Width(weatherToday.textDay);
+      u8g2.setCursor(77 + (51 - wtw) / 2, 38); u8g2.print(weatherToday.textDay);
+
+      // --- ⑤ 气温: 基线=49, 顶≈39与文字底交叠1px, 底≈51离分割线1px ---
+      char tempBuf[14];
+      snprintf(tempBuf, sizeof(tempBuf), "%d~%d°", weatherToday.tempMin, weatherToday.tempMax);
+      u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+      int twu = u8g2.getUTF8Width(tempBuf);
+      u8g2.setCursor(77 + (51 - twu) / 2, 49); u8g2.print(tempBuf);
+    } else {
+      u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+      u8g2.setCursor(84, 22); u8g2.print(hasConfig ? "请手动" : "请设置");
+      u8g2.setCursor(84, 40); u8g2.print(hasConfig ? "重试刷新" : "相关信息");
     }
     break;
 
-  default: // CLOCK_INIT / CLOCK_SETUP (WiFi已连)
+  default:
     u8g2.setFont(u8g2_font_wqy12_t_gb2312);
-    u8g2.setCursor(82, 22); u8g2.print(hasConfig ? "请手动" : "请设置");
-    u8g2.setCursor(82, 40); u8g2.print(hasConfig ? "重试刷新" : "相关信息");
+    u8g2.setCursor(84, 22); u8g2.print(hasConfig ? "请手动" : "请设置");
+    u8g2.setCursor(84, 40); u8g2.print(hasConfig ? "重试刷新" : "相关信息");
     break;
+  }
+
+  // ============ 底部区 (0-127, 52-63, 12px): 明日天气居中 ============
+  if (hasWeather && clockState == CLOCK_RUNNING) {
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    char tmrBuf[54];
+    snprintf(tmrBuf, sizeof(tmrBuf), "明日天气：%s %d~%d°",
+             weatherTomorrow.textDay, weatherTomorrow.tempMin, weatherTomorrow.tempMax);
+    int tmrW = u8g2.getUTF8Width(tmrBuf);
+    if (tmrW > 126) { // 约126px居中, 超出跑马灯
+      needFasterRefresh = true;
+      if (scrollTick) {
+        bottomScrollOff += bottomScrollDir * 3;
+        if (bottomScrollOff <= -(tmrW - 126 + 8)) bottomScrollDir = 1;
+        if (bottomScrollOff >= 0) bottomScrollDir = -1;
+      }
+      u8g2.setCursor(1 + bottomScrollOff, 63);
+    } else {
+      bottomScrollOff = 0; bottomScrollDir = 1;
+      u8g2.setCursor((128 - tmrW) / 2, 63);
+    }
+    u8g2.print(tmrBuf);
   }
 
   u8g2.sendBuffer();
@@ -3497,9 +3597,12 @@ void loop() {
       break;
 
     case CLOCK_RUNNING:
-      if (millis() - lastClockUpdate >= 1000) {
-        lastClockUpdate = millis();
-        updateClockDisplay();
+      {
+        unsigned long refInterval = needFasterRefresh ? 250 : 1000;
+        if (millis() - lastClockUpdate >= refInterval) {
+          lastClockUpdate = millis();
+          updateClockDisplay();
+        }
       }
       // 定时刷新天气(非阻塞,后台任务)
       if (!clockFetchStarted && routerConnected && millis() - lastWeatherFetch >= 7200000) {
