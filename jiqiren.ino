@@ -25,6 +25,18 @@
 extern "C" int tinfl_decompress_mem_to_mem(void *pOut, size_t outLen, const void *pSrc, size_t srcLen, int flags);
 
 // 天气用FreeRTOS任务, DNS在loopTask预解析, 实际HTTPS用WiFiClientSecure
+SemaphoreHandle_t httpsMutex = NULL; // 串行化所有HTTPS请求, 防止mbedTLS并发踩踏
+
+// RAII锁, 自动释放, 支持超时检测
+struct HttpsLock {
+  bool ok;
+  HttpsLock(TickType_t timeout = pdMS_TO_TICKS(30000)) : ok(false) {
+    if (!httpsMutex) { ok = true; return; }         // 未初始化时降级放行
+    ok = (xSemaphoreTake(httpsMutex, timeout) == pdTRUE);
+  }
+  ~HttpsLock() { if (ok && httpsMutex) xSemaphoreGive(httpsMutex); }
+};
+
 volatile bool httpTaskDone = false;
 struct WParams { IPAddress ip; String host; String path; };
 WParams wp;
@@ -40,6 +52,7 @@ void httpFetchTask(void* pv) {
 void fetchWeatherSafe(); // 实现在全局变量之后
 void fetchWeatherAsync(); // 实现在全局变量之后
 volatile bool weatherRefreshDone = false;
+volatile bool weatherJustUpdated = false; // 天气数据变更时强制刷屏一次
 
 // 城市搜索
 String pendingSearch = "";
@@ -399,7 +412,7 @@ void fetchWeatherSafe() {
   httpTaskDone = false;
   xTaskCreate(httpFetchTask, "httpFetch", 16384, NULL, 1, NULL);
   unsigned long fetchStart = millis();
-  while (!httpTaskDone && (millis() - fetchStart < 15000)) { delay(50); }
+  while (!httpTaskDone && (millis() - fetchStart < 25000)) { delay(100); }
 }
 
 void fetchWeatherAsync() {
@@ -458,7 +471,7 @@ void asyncSearchTask(void* pv) {
   url += weatherApiHost;
   url += "/geo/v2/city/lookup?";
   url += "location=" + urlEncode(searchTermCopy.c_str());
-  url += "&number=10";
+  url += "&number=20";
 
   String payload;
   int httpCode = staBindHttpsGet(url.c_str(), weatherApiKey, payload);
@@ -476,8 +489,10 @@ void asyncSearchTask(void* pv) {
         result += "\"name\":\"" + String(loc["name"].as<const char*>()) + "\",";
         const char* adm1 = loc["adm1"].as<const char*>();
         const char* adm2 = loc["adm2"].as<const char*>();
+        const char* type = loc["type"].as<const char*>();
         result += "\"adm1\":\"" + String(adm1 ? adm1 : "") + "\",";
         result += "\"adm2\":\"" + String(adm2 ? adm2 : "") + "\",";
+        result += "\"type\":\"" + String(type ? type : "") + "\",";
         result += "\"country\":\"" + String(loc["country"].as<const char*>()) + "\"}";
         count++;
       }
@@ -542,10 +557,13 @@ String getShortCityName(const char* cityName) {
   bool changed = true;
   while (changed && name.length() > 3) {
     changed = false;
-    if (name.endsWith("区")) { name = name.substring(0, name.length() - 3); changed = true; }
+    // 完整行政后缀: "地区"/"自治州"先匹配(如"喀什地区"→"喀什"), 不能单独脱"州"
+    if (name.endsWith("地区")) { name = name.substring(0, name.length() - 6); changed = true; }
+    else if (name.endsWith("自治州")) { name = name.substring(0, name.length() - 9); changed = true; }
+    else if (name.endsWith("区")) { name = name.substring(0, name.length() - 3); changed = true; }
     else if (name.endsWith("县")) { name = name.substring(0, name.length() - 3); changed = true; }
     else if (name.endsWith("市")) { name = name.substring(0, name.length() - 3); changed = true; }
-    else if (name.endsWith("州")) { name = name.substring(0, name.length() - 3); changed = true; }
+    else if (name.endsWith("省")) { name = name.substring(0, name.length() - 3); changed = true; }
   }
   // 3) 如果还包含"市"(城市级前缀), 取最后"市"之后的部分
   //    例如 "武汉市" → 去"市"后为空→回退; "武汉" → 无"市"→保持
@@ -569,28 +587,33 @@ String getShortCityName(const char* cityName) {
   return name;
 }
 
-// 和风天气 iconDay → U8g2 open_iconic_weather 字体码点 (基准0x40)
-// 0x40=晴 0x41=少云 0x42=多云 0x43=阴 0x44=小雨 0x45=中雨 0x46=雷雨 0x47=雪 0x48=雾
+// 和风天气 iconDay → U8g2 字体码点 (实测 u8g2 2.35.30)
+// open_iconic_weather_2x: 0x40=云 0x41=多云(云+半露太阳) 0x42=月亮 0x43=雨 0x44=星 0x45=太阳
+// open_iconic_other_2x:   0x40=闪电 0x43=点阵(雾)
 // 和风代码: 100晴 101多云 102少云 103晴间多云 104阴
-//           200-213风  300-318雨(302-304雷阵雨)  400-407雪  500-515雾霾沙尘
-uint16_t getWeatherIconGlyph(const char* iconCode) {
+//           150-153夜 200-213风 300-318雨(302-304雷) 400-407雪 500-515雾
+uint16_t getWeatherIconGlyph(const char* iconCode, uint8_t& fontId) {
   int code = atoi(iconCode);
-  if (code == 100) return 0x40;                              // 晴 → Sunny
-  else if (code == 102) return 0x41;                          // 少云 → Partly Cloudy
-  else if (code == 101 || code == 103) return 0x42;           // 多云/晴间多云 → Cloudy
-  else if (code == 104) return 0x43;                          // 阴 → Overcast
-  else if (code >= 302 && code <= 304) return 0x46;           // 雷阵雨 → Thunderstorm
-  else if (code >= 300 && code <= 318) return 0x45;           // 雨(阵雨/小雨/中雨/大雨/暴雨) → Rain
-  else if (code >= 200 && code <= 213) return 0x46;           // 风(无专用图标,用雷雨替代)
-  else if (code >= 400 && code <= 407) return 0x47;           // 雪 → Snow
-  else if (code >= 500 && code <= 515) return 0x48;           // 雾/霾/沙尘 → Fog/Mist
-  return 0x43; // 兜底 → 阴(Overcast)
+  fontId = 0; // 0=weather字体 1=other字体
+  if (code == 100) { return 0x45; }                           // 晴 → 太阳
+  else if (code == 101 || code == 103) { return 0x41; }        // 多云/晴间多云 → 多云
+  else if (code == 102) { return 0x40; }                       // 少云 → 云
+  else if (code == 104) { return 0x40; }                       // 阴 → 云
+  else if (code >= 150 && code <= 153) { return 0x42; }        // 夜间 → 月亮
+  else if (code >= 302 && code <= 304) { fontId = 1; return 0x40; } // 雷 → other闪电
+  else if (code >= 300 && code <= 318) { return 0x43; }        // 雨 → 雨
+  else if (code >= 400 && code <= 407) { return 0x44; }        // 雪 → 五角星
+  else if (code >= 200 && code <= 213) { return 0x40; }        // 风 → 云兜底
+  else if (code >= 500 && code <= 515) { fontId = 1; return 0x43; } // 雾 → other点阵
+  return 0x40; // 兜底 → 云
 }
 
-// 绘制天气图标 (x,y=基线, open_iconic_weather_2x 16x16)
 void drawWeatherIconGlyph(int x, int y, const char* iconCode) {
-  uint16_t glyph = getWeatherIconGlyph(iconCode);
-  u8g2.setFont(u8g2_font_open_iconic_weather_2x_t);
+  uint8_t fontId = 0;
+  uint16_t glyph = getWeatherIconGlyph(iconCode, fontId);
+  u8g2.setFont(fontId == 1
+    ? u8g2_font_open_iconic_other_2x_t
+    : u8g2_font_open_iconic_weather_2x_t);
   u8g2.drawGlyph(x, y, glyph);
 }
 
@@ -611,21 +634,16 @@ void updateClockDisplay() {
       u8g2.setCursor(8, 48); u8g2.print("WiFi...");
       break;
     case CLOCK_WIFI_FAILED:
-      u8g2.setCursor(8, 24); u8g2.print("WiFi连接");
-      u8g2.setCursor(8, 42); u8g2.print("失败");
-      u8g2.setFont(u8g2_font_6x10_tf);
-      u8g2.setCursor(80, 14); u8g2.print("请检查密码");
-      u8g2.setCursor(80, 28); u8g2.print("重新设置");
-      u8g2.setCursor(80, 42); u8g2.print("或切换WiFi");
+      u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+      u8g2.setCursor(8, 28); u8g2.print("连接失败");
+      u8g2.setCursor(8, 48); u8g2.print("请检查配置");
+      u8g2.setCursor(80, 24); u8g2.print("修改密码");
+      u8g2.setCursor(80, 40); u8g2.print("或重启后");
+      u8g2.setCursor(80, 56); u8g2.print("重新连接");
       break;
     default: // CLOCK_INIT / CLOCK_SETUP (WiFi未连)
-      u8g2.setCursor(16, 24); u8g2.print("请连接");
-      u8g2.setCursor(16, 44); u8g2.print("WiFi");
-      u8g2.setFont(u8g2_font_6x10_tf);
-      u8g2.setCursor(78, 16); u8g2.print("进入WebUI");
-      u8g2.setCursor(78, 30); u8g2.print("192.168.4.1");
-      u8g2.setCursor(78, 44); u8g2.print("连接WiFi后");
-      u8g2.setCursor(78, 56); u8g2.print("自动同步时间");
+      u8g2.setCursor(8, 28); u8g2.print("请连接");
+      u8g2.setCursor(8, 48); u8g2.print("WiFi");
       break;
     }
     u8g2.sendBuffer(); return;
@@ -641,6 +659,8 @@ void updateClockDisplay() {
   const char* rawCity = (strlen(weatherCity) > 0) ? weatherCity : ((strlen(detectedCity) > 0) ? detectedCity : "");
   String shortCity = (strlen(rawCity) > 0) ? getShortCityName(rawCity) : "";
   bool hasWeather = (strlen(weatherToday.textDay) > 0);
+  // 天气数据需匹配当前城市, 否则是旧数据, 不显示避免误导
+  bool weatherMatch = (strlen(lastWeatherOkLoc) > 0 && strcmp(lastWeatherOkLoc, weatherLocationId) == 0);
   bool hasConfig  = (strlen(weatherApiKey) > 0 && strlen(weatherLocationId) > 0);
 
   // 滚动步进计时
@@ -684,47 +704,51 @@ void updateClockDisplay() {
     break;
 
   case CLOCK_RUNNING:
-    if (hasWeather) {
-      // --- ① 城市 (y=0-10): 基线=10, 图标下移1px居中 ---
+    if (hasWeather && weatherMatch) {
+      // --- ① 城市 (y=0-10): ⊙+城市名, 裁剪窗口限制滚动不越圆圈 ---
       if (shortCity.length() > 0) {
-        int mx = 80;
-        u8g2.drawCircle(mx + 3, 5, 3);       // ⊙ 直径7px圆圈
-        u8g2.drawDisc(mx + 3, 5, 1);         // 中心实心点
+        // 先画圆圈(不受裁剪窗口影响)
+        u8g2.drawCircle(82, 5, 3);            // ⊙ 向左微调避开裁剪
+        u8g2.drawDisc(82, 5, 1);              // 中心实心点
+        // 裁剪窗口: 圆圈右侧+1px到屏幕右边缘
+        u8g2.setClipWindow(87, 0, 127, 11);
         u8g2.setFont(u8g2_font_wqy12_t_gb2312);
         int cw = u8g2.getUTF8Width(shortCity.c_str());
-        int cityW = 41;
+        int cityW = 41; // 86~127=41px
         if (cw > cityW) {
           needFasterRefresh = true;
           if (scrollTick) {
             cityScrollOff += cityScrollDir * 2;
-            if (cityScrollOff <= -(cw - cityW + 6)) cityScrollDir = 1;
+            if (cityScrollOff <= -(cw - cityW)) cityScrollDir = 1;
             if (cityScrollOff >= 0) cityScrollDir = -1;
           }
-          u8g2.setCursor(89 + cityScrollOff, 10);
+          u8g2.setCursor(87 + cityScrollOff, 10);
         } else {
           cityScrollOff = 0; cityScrollDir = 1;
-          u8g2.setCursor(89, 10);
+          u8g2.setCursor(87, 10);
         }
         u8g2.print(shortCity);
+        // 恢复全屏裁剪
+        u8g2.setClipWindow(0, 0, 127, 63);
       }
       u8g2.drawHLine(78, 11, 49); // 实线 ①②间
 
-      // --- ②③ 天气图标 (y=12-27): drawGlyph(93,27)→y≈11-27 ---
-      drawWeatherIconGlyph(93, 27, weatherToday.iconDay);
+      // --- ②③ 天气图标 (y=13-28): drawGlyph(93,28)→y≈12-28 ---
+      drawWeatherIconGlyph(93, 28, weatherToday.iconDay);
 
-      for (int dx = 78; dx < 126; dx += 5) { u8g2.drawHLine(dx, 28, 3); } // 虚线 y=28
+      for (int dx = 78; dx < 126; dx += 5) { u8g2.drawHLine(dx, 29, 3); } // 虚线 y=29
 
-      // --- ④ 天气文字: 基线=38, 顶≈28与虚线重叠(文字优先) ---
+      // --- ④ 天气文字: 基线=39 ---
       u8g2.setFont(u8g2_font_wqy12_t_gb2312);
       int wtw = u8g2.getUTF8Width(weatherToday.textDay);
-      u8g2.setCursor(77 + (51 - wtw) / 2, 38); u8g2.print(weatherToday.textDay);
+      u8g2.setCursor(77 + (51 - wtw) / 2, 39); u8g2.print(weatherToday.textDay);
 
-      // --- ⑤ 气温: 基线=49, 顶≈39与文字底交叠1px, 底≈51离分割线1px ---
+      // --- ⑤ 气温: 基线=50 ---
       char tempBuf[14];
       snprintf(tempBuf, sizeof(tempBuf), "%d~%d°", weatherToday.tempMin, weatherToday.tempMax);
       u8g2.setFont(u8g2_font_wqy12_t_gb2312);
       int twu = u8g2.getUTF8Width(tempBuf);
-      u8g2.setCursor(77 + (51 - twu) / 2, 49); u8g2.print(tempBuf);
+      u8g2.setCursor(77 + (51 - twu) / 2, 50); u8g2.print(tempBuf);
     } else {
       u8g2.setFont(u8g2_font_wqy12_t_gb2312);
       u8g2.setCursor(84, 22); u8g2.print(hasConfig ? "请手动" : "请设置");
@@ -740,7 +764,7 @@ void updateClockDisplay() {
   }
 
   // ============ 底部区 (0-127, 52-63, 12px): 明日天气居中 ============
-  if (hasWeather && clockState == CLOCK_RUNNING) {
+  if (hasWeather && weatherMatch && clockState == CLOCK_RUNNING) {
     u8g2.setFont(u8g2_font_wqy12_t_gb2312);
     char tmrBuf[54];
     snprintf(tmrBuf, sizeof(tmrBuf), "明日天气：%s %d~%d°",
@@ -768,15 +792,17 @@ void updateClockDisplay() {
 bool gzipDecompress(uint8_t* src, size_t srcLen, String& out) {
   if (srcLen < 18) return false;
   if (src[0] != 0x1F || src[1] != 0x8B) return false;
+
   size_t pos = 10;
   uint8_t flags = src[3];
   if (flags & 0x04) { if (pos + 2 > srcLen) return false; pos += 2 + (src[pos] | (src[pos + 1] << 8)); }
   if (flags & 0x08) { while (pos < srcLen && src[pos++] != 0); }
   if (flags & 0x10) { while (pos < srcLen && src[pos++] != 0); }
   if (flags & 0x02) pos += 2;
-  if (pos + 8 > srcLen) return false;
+  if (pos + 8 > srcLen) { Serial.print("  [GZ] 头太大 pos="); Serial.print(pos); Serial.print(" len="); Serial.println(srcLen); return false; }
   size_t deflateLen = srcLen - pos - 8;
-  size_t outLen = deflateLen * 6;
+  size_t outLen = deflateLen * 30;
+  if (outLen < 4096) outLen = 4096;
   uint8_t* outBuf = (uint8_t*)malloc(outLen + 1);
   if (!outBuf) return false;
   int actualLen = tinfl_decompress_mem_to_mem(outBuf, outLen, src + pos, deflateLen, 0);
@@ -787,50 +813,59 @@ bool gzipDecompress(uint8_t* src, size_t srcLen, String& out) {
   return true;
 }
 
-// HTTPS请求辅助（跳过TLS证书验证 + Gzip解压）
+// HTTPS请求辅助（跳过TLS证书验证 + Gzip解压）, 互斥锁+1次重试
 int qwHttpGet(const char* url, String& payload) {
-  // DNS解析+诊断
-  String host;
-  const char* p = url + 8;
-  while (*p && *p != '/' && *p != ':') host += *p++;
-  IPAddress ip;
-  bool dnsOk = WiFi.hostByName(host.c_str(), ip) && (uint32_t)ip != 0;
-  Serial.print("DNS ");
-  Serial.print(host);
-  Serial.print(" -> ");
-  Serial.print(ip.toString());
-  if (!dnsOk) {
-    Serial.println(" 失败!");
-    return -1;
-  }
-  struct tm ti;
-  if (getLocalTime(&ti)) {
-    Serial.printf(" 时间:%04d-%02d-%02d", ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday);
-  }
-  Serial.println();
+  int code = -1;
+  for (int retry = 0; retry < 2; retry++) {
+    if (retry > 0) { Serial.print("  [qwHTTP] 重试"); Serial.println(retry); delay(800); }
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(15000);
-  http.begin(client, url);
-  http.addHeader("X-QW-Api-Key", weatherApiKey);
+    HttpsLock lock;
+    if (!lock.ok) { Serial.println("  [qwHTTP] 获取锁超时"); return -1; }
 
-  int code = http.GET();
-  if (code == 200) {
-    payload = http.getString();
-    int rawLen = payload.length();
-    if (rawLen > 18 && (uint8_t)payload[0] == 0x1F && (uint8_t)payload[1] == 0x8B) {
-      String decompressed;
-      if (gzipDecompress((uint8_t*)payload.c_str(), rawLen, decompressed)) {
-        payload = decompressed;
-      }
+    // DNS解析+诊断
+    String host;
+    const char* p = url + 8;
+    while (*p && *p != '/' && *p != ':') host += *p++;
+    IPAddress ip;
+    bool dnsOk = WiFi.hostByName(host.c_str(), ip) && (uint32_t)ip != 0;
+    Serial.print("DNS ");
+    Serial.print(host);
+    Serial.print(" -> ");
+    Serial.print(ip.toString());
+    if (!dnsOk) {
+      Serial.println(" 失败!");
+      code = -1; continue;
     }
-  } else {
-    Serial.print("HTTP错误: ");
-    Serial.println(http.errorToString(code).c_str());
+    struct tm ti;
+    if (getLocalTime(&ti)) {
+      Serial.printf(" 时间:%04d-%02d-%02d", ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday);
+    }
+    Serial.println();
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(15000);
+    http.begin(client, url);
+    http.addHeader("X-QW-Api-Key", weatherApiKey);
+
+    code = http.GET();
+    if (code == 200) {
+      payload = http.getString();
+      int rawLen = payload.length();
+      if (rawLen > 18 && (uint8_t)payload[0] == 0x1F && (uint8_t)payload[1] == 0x8B) {
+        String decompressed;
+        if (gzipDecompress((uint8_t*)payload.c_str(), rawLen, decompressed)) {
+          payload = decompressed;
+        }
+      }
+    } else {
+      Serial.print("HTTP错误: ");
+      Serial.println(http.errorToString(code).c_str());
+    }
+    http.end();
+    if (code == 200) break;
   }
-  http.end();
   return code;
 }
 
@@ -922,7 +957,7 @@ void searchCityByCoord(float lat, float lon) {
   if (strlen(weatherApiKey) == 0) return;
 
   char coordStr[24];
-  snprintf(coordStr, sizeof(coordStr), "%.2f,%.2f", lon, lat); // QWeather格式: 经度,纬度
+  snprintf(coordStr, sizeof(coordStr), "%.2f,%.2f", lon, lat); // 和风天气格式: 经度,纬度
 
   String url = "https://";
   url += weatherApiHost;
@@ -1012,104 +1047,246 @@ void searchCityByAPI(const char* cityName) {
   }
 }
 
-// HTTPS GET — WiFiClientSecure(内置超时/STA路由)
-int staBindHttpsGet(const char* url, const char* apiKey, String& payload) {
-  payload = "";
-  String host;
-  const char* pu = url + 8;
-  while (*pu && *pu != '/' && *pu != ':') host += *pu++;
-  String path = (*pu) ? pu : "/";
+// 带超时的TCP连接: 非阻塞+select, 返回已连接socket fd, 失败返回-1
+static int tcpConnectTimeout(IPAddress ip, uint16_t port, int timeoutSec) {
+  int sock = lwip_socket(AF_INET, SOCK_STREAM, 0);
+  if (sock < 0) return -1;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
+  // 非阻塞模式
+  int flags = lwip_fcntl(sock, F_GETFL, 0);
+  lwip_fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
-  Serial.print("  [TCP] 连接 "); Serial.print(host); Serial.print(":443 ");
-  unsigned long t0 = millis();
-  if (!client.connect(host.c_str(), 443)) {
-    Serial.print("失败, 耗时"); Serial.print(millis() - t0); Serial.println("ms");
-    return -1;
-  }
-  Serial.print("OK, 耗时"); Serial.print(millis() - t0); Serial.println("ms");
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = lwip_htons(port);
+  addr.sin_addr.s_addr = (uint32_t)ip;
 
-  String req = "GET " + path + " HTTP/1.1\r\n";
-  req += "Host: " + host + "\r\n";
-  req += "X-QW-Api-Key: " + String(apiKey) + "\r\n";
-  req += "Accept-Encoding: gzip\r\n";
-  req += "Connection: close\r\n\r\n";
-  client.print(req);
+  int ret = lwip_connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+  if (ret < 0 && errno != EINPROGRESS) { lwip_close(sock); return -1; }
 
-  unsigned long t1 = millis();
-  while ((client.connected() || client.available()) && (millis() - t1 < 15000)) {
-    while (client.available()) { payload += (char)client.read(); t1 = millis(); }
-    delay(1);
-  }
-  client.stop();
+  if (ret < 0) { // EINPROGRESS — 等待连接完成
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(sock, &wfds);
+    struct timeval tv = {timeoutSec, 0};
+    ret = lwip_select(sock + 1, NULL, &wfds, NULL, &tv);
+    if (ret <= 0) { lwip_close(sock); return -1; }
 
-  Serial.print("  [HTTP] 响应 "); Serial.print(payload.length()); Serial.print(" 字节, 耗时");
-  Serial.print(millis() - t0); Serial.println("ms");
-
-  if (payload.length() == 0) return -1;
-
-  int hdrEnd = payload.indexOf("\r\n\r\n");
-  if (hdrEnd >= 0) payload = payload.substring(hdrEnd + 4);
-
-  if (payload.length() > 18 && (uint8_t)payload[0] == 0x1F && (uint8_t)payload[1] == 0x8B) {
-    String decompressed;
-    if (gzipDecompress((uint8_t*)payload.c_str(), payload.length(), decompressed)) {
-      payload = decompressed;
-    }
+    int err = 0;
+    socklen_t len = sizeof(err);
+    lwip_getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+    if (err != 0) { lwip_close(sock); return -1; }
   }
 
-  return 200;
+  // 恢复阻塞
+  lwip_fcntl(sock, F_SETFL, flags);
+  return sock;
 }
 
-// HTTPS GET (预解析IP) — WiFiClientSecure, FreeRTOS任务安全
-int staBindHttpsGetIP(const IPAddress& ip, const String& host, const String& path, const char* apiKey, String& payload) {
-  payload = "";
+// HTTPS GET — 自管socket+mbedTLS, 各阶段均有超时, 互斥锁+1次重试
+int staBindHttpsGet(const char* url, const char* apiKey, String& payload) {
+  const int CONNECT_TIMEOUT = 15; // TCP连接超时(秒)
+  const int TLS_TIMEOUT     = 15; // TLS握手超时(秒)
+  const int READ_TIMEOUT    = 20; // HTTP响应读取超时(秒)
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(10000);
+  int code = -1;
+  for (int retry = 0; retry < 2; retry++) {
+    if (retry > 0) { Serial.print("  [HTTPS] 重试"); Serial.println(retry); delay(800); }
 
-  Serial.print("  [TCP] 连接 "); Serial.print(ip.toString()); Serial.print(":443 ");
-  unsigned long t0 = millis();
-  if (!client.connect(ip, 443)) {
-    Serial.print("失败, 耗时"); Serial.print(millis() - t0); Serial.println("ms");
-    return -1;
-  }
-  Serial.print("OK, 耗时"); Serial.print(millis() - t0); Serial.println("ms");
+    HttpsLock lock;
+    if (!lock.ok) { Serial.println("  [HTTPS] 获取锁超时"); return -1; }
 
-  String req = "GET " + path + " HTTP/1.1\r\n";
-  req += "Host: " + host + "\r\n";
-  req += "X-QW-Api-Key: " + String(apiKey) + "\r\n";
-  req += "Accept-Encoding: gzip\r\n";
-  req += "Connection: close\r\n\r\n";
-  client.print(req);
+    payload = "";
+    String host;
+    const char* pu = url + 8;
+    while (*pu && *pu != '/' && *pu != ':') host += *pu++;
+    String path = (*pu) ? pu : "/";
 
-  unsigned long t1 = millis();
-  while ((client.connected() || client.available()) && (millis() - t1 < 15000)) {
-    while (client.available()) { payload += (char)client.read(); t1 = millis(); }
-    delay(1);
-  }
-  client.stop();
-
-  Serial.print("  [HTTP] 响应 "); Serial.print(payload.length()); Serial.print(" 字节, 耗时");
-  Serial.print(millis() - t0); Serial.println("ms");
-
-  if (payload.length() == 0) return -1;
-
-  int hdrEnd = payload.indexOf("\r\n\r\n");
-  if (hdrEnd >= 0) payload = payload.substring(hdrEnd + 4);
-
-  if (payload.length() > 18 && (uint8_t)payload[0] == 0x1F && (uint8_t)payload[1] == 0x8B) {
-    String decompressed;
-    if (gzipDecompress((uint8_t*)payload.c_str(), payload.length(), decompressed)) {
-      payload = decompressed;
+    // 1) DNS预解析
+    Serial.print("  [DNS] "); Serial.print(host); Serial.print(" -> ");
+    unsigned long t0 = millis();
+    IPAddress ip;
+    if (!WiFi.hostByName(host.c_str(), ip) || (uint32_t)ip == 0) {
+      Serial.print("失败, 耗时"); Serial.println(millis() - t0);
+      code = -1; continue;
     }
-  }
+    Serial.print(ip.toString()); Serial.print(" ("); Serial.print(millis() - t0); Serial.println("ms)");
 
-  return 200;
+    // 2) TCP连接(带超时)
+    Serial.print("  [TCP] 连接 "); Serial.print(ip.toString()); Serial.print(":443 ");
+    unsigned long tcp0 = millis();
+    int sock = tcpConnectTimeout(ip, 443, CONNECT_TIMEOUT);
+    if (sock < 0) {
+      Serial.print("失败, 耗时"); Serial.println(millis() - tcp0);
+      code = -1; continue;
+    }
+    Serial.print("OK, 耗时"); Serial.println(millis() - tcp0);
+
+    // 设置socket级超时: mbedTLS在阻塞socket上做I/O, 必须靠SO_RCVTIMEO/SO_SNDTIMEO防止卡死
+    // 设为15s以容忍服务器分片发送响应(Content-Length=507的gzip体可能分多段到达)
+    struct timeval sock_tv;
+    sock_tv.tv_sec = 15; sock_tv.tv_usec = 0;
+    lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &sock_tv, sizeof(sock_tv));
+    lwip_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &sock_tv, sizeof(sock_tv));
+
+    // 3) TLS握手 (mbedTLS, 不验证证书)
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+
+    mbedtls_ssl_init(&ssl);
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+
+    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0);
+    mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+    mbedtls_ssl_conf_read_timeout(&conf, READ_TIMEOUT * 1000);
+
+    mbedtls_ssl_setup(&ssl, &conf);
+    mbedtls_ssl_set_bio(&ssl, &sock, mbedtls_net_send, mbedtls_net_recv, NULL);
+    mbedtls_ssl_set_hostname(&ssl, host.c_str());
+
+    unsigned long tls0 = millis();
+    int hr;
+    while ((hr = mbedtls_ssl_handshake(&ssl)) != 0) {
+      if (hr != MBEDTLS_ERR_SSL_WANT_READ && hr != MBEDTLS_ERR_SSL_WANT_WRITE) {
+        char ebuf[64]; mbedtls_strerror(hr, ebuf, sizeof(ebuf));
+        Serial.print("  [TLS] 失败: "); Serial.println(ebuf);
+        break;
+      }
+      if (millis() - tls0 > TLS_TIMEOUT * 1000) { Serial.println("  [TLS] 超时"); hr = -1; break; }
+      delay(10);
+    }
+    if (hr != 0) {
+      mbedtls_ssl_free(&ssl); mbedtls_ssl_config_free(&conf);
+      mbedtls_ctr_drbg_free(&ctr_drbg); mbedtls_entropy_free(&entropy);
+      lwip_close(sock);
+      code = -1; continue;
+    }
+    Serial.print("  [TLS] OK, 耗时"); Serial.println(millis() - tls0);
+
+    // 4) 发送HTTP请求 (循环写入确保完整发送)
+    String req = "GET " + path + " HTTP/1.1\r\n";
+    req += "Host: " + host + "\r\n";
+    req += "X-QW-Api-Key: " + String(apiKey) + "\r\n";
+    req += "Accept-Encoding: gzip\r\n";
+    req += "Connection: close\r\n\r\n";
+    int total = req.length();
+    int written = 0;
+    while (written < total) {
+      int ret = mbedtls_ssl_write(&ssl, (const unsigned char*)req.c_str() + written, total - written);
+      if (ret <= 0) break;
+      written += ret;
+    }
+
+    // 5) 读取响应
+    unsigned long rd0 = millis();
+    char buf[512];
+    while (millis() - rd0 < READ_TIMEOUT * 1000) {
+      int nr = mbedtls_ssl_read(&ssl, (unsigned char*)buf, sizeof(buf) - 1);
+      if (nr > 0) { payload.concat(buf, nr); rd0 = millis(); }
+      else if (nr == 0 || nr == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) break;
+      else if (nr != MBEDTLS_ERR_SSL_WANT_READ && nr != MBEDTLS_ERR_SSL_WANT_WRITE) break;
+      delay(1);
+    }
+
+    // 6) 清理
+    mbedtls_ssl_close_notify(&ssl);
+    mbedtls_ssl_free(&ssl); mbedtls_ssl_config_free(&conf);
+    mbedtls_ctr_drbg_free(&ctr_drbg); mbedtls_entropy_free(&entropy);
+    lwip_close(sock);
+
+    Serial.print("  [HTTP] 响应 "); Serial.print(payload.length()); Serial.print(" 字节, 耗时");
+    Serial.println(millis() - t0);
+
+    if (payload.length() == 0) { code = -1; continue; }
+
+    // 找HTTP头体边界: 从gzip魔数向前回溯到最近的\r\n\r\n
+    String gzMagic;
+    gzMagic += (char)0x1F; gzMagic += (char)0x8B;
+    int gzPos = payload.indexOf(gzMagic);
+    if (gzPos > 0) {
+      String before = payload.substring(0, gzPos);
+      int hdrEnd = before.lastIndexOf("\r\n\r\n");
+      if (hdrEnd >= 0) { payload = payload.substring(hdrEnd + 4); }
+      else { payload = payload.substring(gzPos); }
+    } else {
+      int hdrEnd = payload.indexOf("\r\n\r\n");
+      if (hdrEnd >= 0) payload = payload.substring(hdrEnd + 4);
+    }
+
+    if (payload.length() > 18 && (uint8_t)payload[0] == 0x1F && (uint8_t)payload[1] == 0x8B) {
+      String decompressed;
+      if (gzipDecompress((uint8_t*)payload.c_str(), payload.length(), decompressed)) {
+        payload = decompressed;
+      }
+    }
+
+    code = 200; break;
+  }
+  return code;
+}
+
+// HTTPS GET (预解析IP) — WiFiClientSecure, FreeRTOS任务安全, 互斥锁+1次重试
+int staBindHttpsGetIP(const IPAddress& ip, const String& host, const String& path, const char* apiKey, String& payload) {
+  int code = -1;
+  for (int retry = 0; retry < 2; retry++) {
+    if (retry > 0) { Serial.print("  [HTTPS-IP] 重试"); Serial.println(retry); delay(800); }
+
+    HttpsLock lock;
+    if (!lock.ok) { Serial.println("  [HTTPS-IP] 获取锁超时"); return -1; }
+
+    payload = "";
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(10000);
+
+    Serial.print("  [TCP] 连接 "); Serial.print(ip.toString()); Serial.print(":443 ");
+    unsigned long t0 = millis();
+    if (!client.connect(ip, 443)) {
+      Serial.print("失败, 耗时"); Serial.print(millis() - t0); Serial.println("ms");
+      code = -1; continue;
+    }
+    Serial.print("OK, 耗时"); Serial.print(millis() - t0); Serial.println("ms");
+
+    String req = "GET " + path + " HTTP/1.1\r\n";
+    req += "Host: " + host + "\r\n";
+    req += "X-QW-Api-Key: " + String(apiKey) + "\r\n";
+    req += "Accept-Encoding: gzip\r\n";
+    req += "Connection: close\r\n\r\n";
+    client.print(req);
+
+    unsigned long t1 = millis();
+    while ((client.connected() || client.available()) && (millis() - t1 < 15000)) {
+      while (client.available()) { payload += (char)client.read(); t1 = millis(); }
+      delay(1);
+    }
+    client.stop();
+
+    Serial.print("  [HTTP] 响应 "); Serial.print(payload.length()); Serial.print(" 字节, 耗时");
+    Serial.print(millis() - t0); Serial.println("ms");
+
+    if (payload.length() == 0) { code = -1; continue; }
+
+    int hdrEnd = payload.indexOf("\r\n\r\n");
+    if (hdrEnd >= 0) payload = payload.substring(hdrEnd + 4);
+
+    if (payload.length() > 18 && (uint8_t)payload[0] == 0x1F && (uint8_t)payload[1] == 0x8B) {
+      String decompressed;
+      if (gzipDecompress((uint8_t*)payload.c_str(), payload.length(), decompressed)) {
+        payload = decompressed;
+      }
+    }
+
+    code = 200; break;
+  }
+  return code;
 }
 
 // 批量城市搜索（返回多个结果，用于Web端选择）
@@ -1120,7 +1297,7 @@ String searchCityBatch(const char* cityName) {
   url += weatherApiHost;
   url += "/geo/v2/city/lookup?";
   url += "location=" + urlEncode(cityName);
-  url += "&number=10";
+  url += "&number=20";
 
   Serial.print("批量城市搜索(STA-bind): ");
   Serial.println(url);
@@ -1144,8 +1321,10 @@ String searchCityBatch(const char* cityName) {
         result += "\"name\":\"" + String(loc["name"].as<const char*>()) + "\",";
         const char* adm1 = loc["adm1"].as<const char*>();
         const char* adm2 = loc["adm2"].as<const char*>();
+        const char* type = loc["type"].as<const char*>();
         result += "\"adm1\":\"" + String(adm1 ? adm1 : "") + "\",";
         result += "\"adm2\":\"" + String(adm2 ? adm2 : "") + "\",";
+        result += "\"type\":\"" + String(type ? type : "") + "\",";
         result += "\"country\":\"" + String(loc["country"].as<const char*>()) + "\"}";
         count++;
       }
@@ -1255,6 +1434,7 @@ void fetchWeather() {
       }
       lastWeatherOkTime = millis();
       strncpy(lastWeatherOkLoc, weatherLocationId, sizeof(lastWeatherOkLoc) - 1);
+      weatherJustUpdated = true; // 触发屏幕刷新
     } else {
       Serial.print("天气API错误: ");
       Serial.println(doc["code"].as<const char*>());
@@ -1317,55 +1497,46 @@ void connectToRouter() {
 
   WiFi.setSleep(false);
 
-  for (int attempt = 0; attempt < 3; attempt++) {
-    // 完全清除WiFi STA状态
+  for (int attempt = 0; attempt < 2; attempt++) {
+    // 断开STA(不关射频, 保留AP), 确保mode正确后重新begin
     WiFi.disconnect(false, true);
-    delay(800);
-
-    // 等待状态变回 DISCONNECTED（WL_DISCONNECTED=6）
-    int waitStable = 0;
-    while (WiFi.status() != WL_DISCONNECTED && WiFi.status() != WL_IDLE_STATUS && waitStable < 30) {
-      delay(100);
-      waitStable++;
-    }
-    Serial.print("WiFi状态: ");
-    Serial.println(WiFi.status());
+    delay(300); yield();
+    WiFi.mode(WIFI_MODE_APSTA);
+    delay(200); yield();
 
     if (attempt > 0) {
-      Serial.print("重试");
-      Serial.print(attempt + 1);
-      Serial.print("/3: ");
-    } else {
-      Serial.print("连接: ");
+      // 重试: 额外等待让WiFi栈彻底复位
+      delay(1000); yield();
     }
-    Serial.println(routerSSID);
+
+    Serial.print(attempt > 0 ? "重试2/2: " : "连接: ");
+    Serial.print(routerSSID);
+    Serial.print(" (st:"); Serial.print(WiFi.status()); Serial.print(") ");
 
     WiFi.begin(routerSSID, routerPassword);
+    delay(500); yield();
 
     int retry = 0;
-    while (WiFi.status() != WL_CONNECTED && retry < 60) {
-      delay(200);
+    int st;
+    while ((st = WiFi.status()) != WL_CONNECTED && retry < 80) {
+      delay(200); yield();
       if (retry % 5 == 0) Serial.print(".");
       retry++;
-      if (WiFi.status() == WL_CONNECT_FAILED) {
-        Serial.print("X");
-        break;
-      }
+      if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) break;
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
+    if (st == WL_CONNECTED) {
       routerConnected = true;
-      Serial.println("\nWiFi已连接!");
-      Serial.print("IP: ");
-      Serial.println(WiFi.localIP());
-      delay(2000);
+      Serial.println(" OK!");
+      Serial.print("IP: "); Serial.println(WiFi.localIP());
+      delay(300); yield();
       return;
     }
-    Serial.println();
+    Serial.print("X(st:"); Serial.print(st); Serial.print(") ");
   }
 
   routerConnected = false;
-  Serial.println("WiFi连接失败(已重试3次)");
+  Serial.println(" -> WiFi连接失败(已重试2次)");
 }
 
 /* ================= WiFi控制电机函数 ================= */
@@ -2225,7 +2396,7 @@ h2 {
     <input type="password" id="cfg_apikey" placeholder="和风天气API Key">
   </div>
   <div class="config-row">
-    <button onclick="saveWeatherConfig()" style="flex:1;background:linear-gradient(145deg,#00e6ff,#0099cc);color:#fff;font-size:13px;padding:8px">保存API配置</button>
+    <button id="btnSaveApi" onclick="saveWeatherConfig()" style="flex:1;background:linear-gradient(145deg,#00e6ff,#0099cc);color:#fff;font-size:13px;padding:8px">保存API配置</button>
   </div>
   <h4>📍 城市设置（默认自动获取）</h4>
   <div class="config-row">
@@ -2330,6 +2501,17 @@ function updateModeButtons(mode) {
   } else if(mode === 'clock') {
     document.getElementById('btn_clock').classList.add('active');
   }
+
+  // WiFi/天气配置仅在时钟模式下显示
+  const wifiSection = document.getElementById('wifiSection');
+  const weatherSection = document.getElementById('weatherSection');
+  if (mode === 'clock') {
+    if (wifiSection) wifiSection.style.display = 'block';
+    // weatherSection 显示由 loadConfig 根据WiFi连接状态控制
+  } else {
+    if (wifiSection) wifiSection.style.display = 'none';
+    if (weatherSection) weatherSection.style.display = 'none';
+  }
 }
 
 // 模式切换函数
@@ -2386,9 +2568,10 @@ function connectWifiAction() {
   if (!ssid) { alert('请先扫描并选择WiFi'); return; }
   const btn = document.getElementById('btn_connectWifi');
   const status = document.getElementById('wifiStatus');
+  const weatherSection = document.getElementById('weatherSection');
   btn.textContent = '连接中...';
   btn.disabled = true;
-  status.textContent = '正在保存配置...';
+  status.textContent = '正在连接...';
   fetch('/connectWifi?ssid=' + encodeURIComponent(ssid) +
     '&password=' + encodeURIComponent(password))
     .then(r => r.text())
@@ -2396,19 +2579,17 @@ function connectWifiAction() {
       status.textContent = t;
       btn.textContent = '连接WiFi';
       btn.disabled = false;
-      // 检测到重启指令，提示用户等待
-      if (t.indexOf('重启') >= 0) {
-        status.textContent = t + ' 请等待3-5秒后刷新页面...';
-        btn.style.display = 'none';
+      if (t.indexOf('成功') >= 0) {
+        btn.style.background = 'linear-gradient(145deg,#00ff9c,#00c46a)';
+        btn.textContent = '✓ 已连接';
+        if (weatherSection) weatherSection.style.display = 'block';
       }
       loadConfig();
     })
     .catch(e => {
-      // 设备可能重启了，提示用户等待
-      status.textContent = '设备正在重启，请等待5秒后刷新页面...';
-      btn.textContent = '等待重启...';
-      btn.disabled = true;
-      btn.style.opacity = '0.5';
+      status.textContent = '连接失败，请重试';
+      btn.textContent = '连接WiFi';
+      btn.disabled = false;
     });
 }
 
@@ -2417,16 +2598,20 @@ function saveWeatherConfig() {
   const apiKey = document.getElementById('cfg_apikey').value;
   const apiHost = document.getElementById('cfg_apihost').value;
   if (!apiKey) { alert('请填写和风天气API Key'); return; }
+  const btn = document.getElementById('btnSaveApi');
+  btn.textContent = '保存中...'; btn.disabled = true; btn.style.opacity = 0.5;
   fetch('/saveApiConfig?apiKey=' + encodeURIComponent(apiKey) +
     '&apiHost=' + encodeURIComponent(apiHost || 'devapi.qweather.com'))
     .then(r => r.text())
     .then(t => {
       alert(t);
       loadConfig();
-      // 自动尝试获取天气
       refreshWeather();
     })
-    .catch(e => { alert('保存失败: ' + e); });
+    .catch(e => { alert('保存失败: ' + e); })
+    .finally(() => {
+      btn.textContent = '保存API配置'; btn.disabled = false; btn.style.opacity = 1;
+    });
 }
 
 // 城市搜索（异步轮询模式）
@@ -2457,9 +2642,47 @@ function searchCity() {
                 d.forEach(function(city) {
                   const opt = document.createElement('option');
                   opt.value = city.id;
+                  opt.setAttribute('data-name', city.name);
+
+                  // 去掉行政后缀用于比对 (如 "湖北省"→"湖北", "武汉市"→"武汉")
+                  function stripAdm(s) {
+                    if (!s) return '';
+                    const sfx = ['特别行政区','自治区','自治州','自治县','地区','市','区','县','州','省','盟','旗'];
+                    for (var i = 0; i < sfx.length; i++) {
+                      if (s.endsWith(sfx[i])) return s.substring(0, s.length - sfx[i].length);
+                    }
+                    return s;
+                  }
+                  var nameCore = stripAdm(city.name);
+                  var adm1Core = stripAdm(city.adm1);
+                  var adm2Core = stripAdm(city.adm2);
+
+                  // 根据 name 与 adm1/adm2 的关系判断真实行政层级
+                  // 先查adm2(含直辖市如"北京"), 再查adm1
+                  // 子级地区: 地级市下级→区; 自治州/地区/盟下级→保留API原始type(县/县级市)
+                  var realType = city.type; // 兜底
+                  if (adm2Core && nameCore === adm2Core) {
+                    realType = 'city';
+                  } else if (adm1Core && nameCore === adm1Core) {
+                    realType = 'province';
+                  } else if (adm1Core && adm2Core) {
+                    if (!/(自治州|地区|盟)$/.test(city.adm2)) {
+                      realType = 'district'; // 地级市/直辖市下级 → 区
+                    }
+                    // 自治州/地区/盟下级 → 保持API原始type (city=县级市, county=县)
+                  }
+
+                  const typeTag = {province:'省', city:'市', district:'区', county:'县', scenic:'景点'};
                   let label = city.name;
-                  if (city.adm1) label += ' - ' + city.adm1;
-                  if (city.adm2 && city.adm2 !== city.name) label += ' ' + city.adm2;
+                  if (typeTag[realType]) label += ' [' + typeTag[realType] + ']';
+                  if (city.adm1 && city.adm1 !== city.name) label += ' - ' + city.adm1;
+                  if (city.adm2 && city.adm2 !== city.name) {
+                    let adm2Show = city.adm2;
+                    // 补后缀: 地级市名补"市", 自治州/地区/盟保持原名
+                    if (!/(市|区|县|州|盟|地区|自治州)$/.test(adm2Show)) adm2Show += '市';
+                    // 避免与adm1重复 (如浦东新区: 上海市=上海市)
+                    if (adm2Show !== city.adm1) label += ' ' + adm2Show;
+                  }
                   opt.textContent = label;
                   sel.appendChild(opt);
                 });
@@ -2479,7 +2702,7 @@ function searchCity() {
 function onCitySelect() {
   const sel = document.getElementById('cfg_citylist');
   const locationId = sel.value;
-  const cityName = sel.options[sel.selectedIndex].text;
+  const cityName = sel.options[sel.selectedIndex].getAttribute('data-name') || sel.options[sel.selectedIndex].text;
   if (!locationId) return;
   document.getElementById('cityStatus').textContent = '设置城市中...';
   fetch('/setCity?locationId=' + encodeURIComponent(locationId) +
@@ -2559,11 +2782,14 @@ function loadConfig() {
       document.getElementById('cfg_apikey').value = d.apiKey || '';
       document.getElementById('cfg_apihost').value = d.apiHost || 'devapi.qweather.com';
 
-      // 根据WiFi连接状态显示/隐藏天气配置区域
+      // 根据WiFi连接状态和当前模式显示/隐藏天气配置区域
       const weatherSection = document.getElementById('weatherSection');
       const wifiStatus = document.getElementById('wifiStatus');
-      if (d.connected) {
+      if (d.connected && currentMode === 'clock') {
         if (weatherSection) weatherSection.style.display = 'block';
+        if (wifiStatus) wifiStatus.textContent = '✓ WiFi已连接';
+      } else if (d.connected) {
+        if (weatherSection) weatherSection.style.display = 'none';
         if (wifiStatus) wifiStatus.textContent = '✓ WiFi已连接';
       } else {
         if (weatherSection) weatherSection.style.display = 'none';
@@ -2609,7 +2835,12 @@ function loadConfig() {
 function setMode(mode){
   sendCommand('/mode_' + mode);
   updateModeButtons(mode);
-  
+
+  // 切换到时钟模式时，刷新配置显示（天气区域等）
+  if (mode === 'clock') {
+    setTimeout(function(){ loadConfig(); }, 500);
+  }
+
   // 切换模式时自动停止
   stopCommand();
 }
@@ -2617,6 +2848,12 @@ function setMode(mode){
 // 页面加载完成后的初始化
 document.addEventListener('DOMContentLoaded', function() {
   console.log('桌面机器人控制页面已加载');
+
+  // 初始隐藏WiFi/天气配置（仅在时钟模式显示）
+  const wifiSec = document.getElementById('wifiSection');
+  const weatherSec = document.getElementById('weatherSection');
+  if (wifiSec) wifiSec.style.display = 'none';
+  if (weatherSec) weatherSec.style.display = 'none';
 
   // 立即移除所有输入框的焦点
   setTimeout(function() {
@@ -2884,8 +3121,9 @@ void setupServer() {
       Serial.println("WiFi配置已更改，重置连接");
       clockModeInitialized = false;
       routerConnected = false;
-      WiFi.disconnect(true);
+      WiFi.disconnect(false, false);  // 仅断开STA，保留AP
       delay(200);
+      yield();
     }
 
     if (wifiConfigChanged && ssid.length() > 0) {
@@ -2940,23 +3178,21 @@ void setupServer() {
     if (locationId.length() > 0) {
       locationId.toCharArray(weatherLocationId, sizeof(weatherLocationId));
       city.toCharArray(weatherCity, sizeof(weatherCity));
+      lastWeatherOkLoc[0] = '\0'; // 换城市后清掉旧匹配, 允许立即刷新
       saveConfigToEEPROM();
       Serial.print("城市设置为: ");
       Serial.print(city);
       Serial.print(" (");
       Serial.print(locationId);
       Serial.println(")");
+      // 先应答, 后台异步刷新天气, 不阻塞WebUI
+      server.send(200, "text/plain", "城市已设置: " + city + (routerConnected ? "，正在刷新天气..." : " (WiFi未连接)"));
       if (routerConnected) {
         fetchWeatherSafe();
         lastWeatherFetch = millis();
-        if (strlen(weatherToday.textDay) > 0) {
-          if (randomMode == RANDOM_CLOCK) { clockSessionReady = true; clockState = CLOCK_RUNNING; }
-          server.send(200, "text/plain", "城市已设置并刷新天气: " + city);
-        } else {
-          server.send(200, "text/plain", "城市已设置,天气获取失败,请手动刷新: " + city);
+        if (strlen(weatherToday.textDay) > 0 && randomMode == RANDOM_CLOCK) {
+          clockSessionReady = true; clockState = CLOCK_RUNNING;
         }
-      } else {
-        server.send(200, "text/plain", "城市已设置: " + city + " (WiFi未连接，天气将在连接后更新)");
       }
     } else {
       server.send(200, "text/plain", "错误：未提供LocationID");
@@ -2986,7 +3222,9 @@ void setupServer() {
     Serial.println("手动刷新天气...");
     fetchWeatherSafe();
     lastWeatherFetch = millis();
-    if (strlen(weatherToday.textDay) > 0) {
+    bool refreshed = (strlen(weatherToday.textDay) > 0
+                      && strcmp(lastWeatherOkLoc, weatherLocationId) == 0);
+    if (refreshed) {
       if (randomMode == RANDOM_CLOCK) { clockSessionReady = true; clockState = CLOCK_RUNNING; }
       server.send(200, "text/plain", "天气已刷新");
     } else {
@@ -3030,22 +3268,14 @@ void setupServer() {
       return;
     }
 
-    // 首次设置WiFi：保存后重启，利用setup()中干净射频连接
-    // setup()中已连接过则会走上面的分支
-    if (!clockModeInitialized) {
-      Serial.println("首次WiFi配置，保存后重启以利用干净射频连接...");
-      server.send(200, "text/plain", "配置已保存！设备即将重启，请等待重新连接...");
-      delay(500);
-      ESP.restart();
-      return;
-    }
-
-    // 已成功连过的设备，直接尝试重连（有多次重试）
-    Serial.print("Web重连WiFi: ");
+    // 直接尝试连接（connectToRouter内部有多次重试）
+    Serial.print("Web连接WiFi: ");
     Serial.println(routerSSID);
+    clockModeInitialized = true;
     connectToRouter();
     if (routerConnected) {
       initSNTP();
+      clockModeInitialized = true;
       if (strlen(weatherApiKey) > 0) {
         if (strlen(weatherLocationId) == 0) {
           strcpy(weatherLocationId, "101200101");
@@ -3080,7 +3310,16 @@ void setupServer() {
       strcpy(weatherCity, "武汉");
       saveConfigToEEPROM();
     }
+    // 先响应, 再后台刷新天气, 避免阻塞导致按钮无反馈
     server.send(200, "text/plain", "天气API配置已保存！");
+    if (routerConnected && strlen(weatherLocationId) > 0) {
+      fetchWeatherSafe();
+      lastWeatherFetch = millis();
+      if (strlen(weatherToday.textDay) > 0 && randomMode == RANDOM_CLOCK) {
+        clockSessionReady = true;
+        clockState = CLOCK_RUNNING;
+      }
+    }
   });
 
   // 测试连接路由
@@ -3316,37 +3555,36 @@ uint16_t getDistance() {
 }
 /* ================= 初始化设置 ================= */
 void setup() {
-    // 初始化电机引脚
-  pinMode(STBY, OUTPUT); digitalWrite(STBY, LOW);
-  pinMode(LF, OUTPUT); pinMode(LB, OUTPUT);
-  pinMode(RF, OUTPUT); pinMode(RB, OUTPUT);
-  Serial.println("电机引脚初始化完成");
-
-  // 增加启动延迟
-  delay(2000);
-
-  // 初始化串口通信
+  // 初始化串口通信(最先)
   Serial.begin(115200);
+  Serial.println();
   Serial.println("===== 桌面机器人启动 =====");
 
-  // 初始化OLED显示屏
+  // 初始化OLED(提前, 立即显示启动信息)
   Serial.println("初始化OLED...");
   if (!display.begin()) {
     Serial.println("OLED初始化失败！");
   } else {
     Serial.println("OLED初始化完成");
     display.clearDisplay();
-    display.setCursor(0, 0);
-    display.print("Start");
-    display.display();
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2.setCursor(30, 18); u8g2.print("系统启动中");
+    u8g2.setCursor(8, 36);  u8g2.print("热点:桌面机器人");
+    u8g2.setCursor(8, 52);  u8g2.print("访问:192.168.4.1");
+    u8g2.sendBuffer();
   }
 
-  // 初始化机器人眼睛动画
-  roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 100);
-  roboEyes.setAutoblinker(ON, 3, 2);
-  roboEyes.setIdleMode(ON, 2, 2);
-  roboEyes.setMood(DEFAULT);
-  Serial.println("机器人眼睛初始化完成");
+  httpsMutex = xSemaphoreCreateMutex();
+  Serial.println(httpsMutex ? "HTTPS互斥锁已创建" : "HTTPS互斥锁创建失败!");
+
+  // 初始化电机引脚
+  pinMode(STBY, OUTPUT); digitalWrite(STBY, LOW);
+  pinMode(LF, OUTPUT); pinMode(LB, OUTPUT);
+  pinMode(RF, OUTPUT); pinMode(RB, OUTPUT);
+  Serial.println("电机引脚初始化完成");
+
+  // 延迟确保外设供电稳定
+  delay(1500);
 
   // 初始化随机种子
   randomSeed(esp_random());
@@ -3358,25 +3596,18 @@ void setup() {
   // 加载EEPROM配置
   loadConfigFromEEPROM();
 
-  // 开机自动连接路由器（仅连WiFi+NTP,不请求天气以加快启动）
+  // 降低发射功率(在connectToRouter之前, 避免干扰已建立的连接)
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  delay(100);
+
+  // 加载EEPROM配置后不在此阻塞WiFi — 交给时钟模式异步连接, 避免开机黑屏卡顿
   if (strlen(routerSSID) > 0) {
-    Serial.println("开机自动连接路由器...");
-    connectToRouter();
-    if (routerConnected) {
-      initSNTP();
-      clockModeInitialized = true;
-      Serial.println("WiFi/NTP就绪,天气将在进入时间模式时获取");
-    }
+    Serial.println("已有WiFi配置, 进入时间模式后自动连接");
+    clockModeInitialized = true;
   } else {
     Serial.println("无WiFi配置，跳过自动连接");
   }
 
-  // 降低发射功率以提高稳定性
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  
-  // 给射频模块一点准备时间
-  delay(100);
-  
   // 启动WiFi热点
   Serial.println("正在启动WiFi热点...");
   WiFi.softAP("桌面机器人");
@@ -3436,15 +3667,14 @@ void setup() {
     Serial.print("防跌落阈值: "); Serial.print(edgeThreshold); Serial.println(" mm");
     latestDistance = baseDistance; // 防止启动时误触发避障
     
-    // 在OLED上显示校准结果（2秒）
-    display.clearDisplay();
-    display.setTextColor(1);
-    display.setCursor(0, 0);
-    display.print("Calibration OK");
-    display.setCursor(0, 12);
-    display.print("Base: "); display.print(baseDistance); display.print("mm");
-    display.display();
-    delay(2000);
+    // 更新OLED: 显示校准结果(使用u8g2, 与系统启动中...保持连贯)
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2.setCursor(12, 28); u8g2.print("传感器已校准");
+    u8g2.setCursor(12, 48);
+    u8g2.print("基准: "); u8g2.print(baseDistance); u8g2.print("mm");
+    u8g2.sendBuffer();
+    delay(1500);
     // 读取一次距离测试
     uint16_t dist = getDistance();
     Serial.print("首次距离读取: ");
@@ -3452,6 +3682,14 @@ void setup() {
     Serial.println(" mm");
   }
   Serial.println("ASR Pro2 串口初始化完成，等待语音指令...");
+
+  // 初始化机器人眼睛动画(校准显示之后, 避免begin()内的clearDisplay()清掉启动画面)
+  roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 100);
+  roboEyes.setAutoblinker(ON, 3, 2);
+  roboEyes.setIdleMode(ON, 2, 2);
+  roboEyes.setMood(DEFAULT);
+  Serial.println("机器人眼睛初始化完成");
+
   // 使能电机驱动
   digitalWrite(STBY, HIGH);
 
@@ -3460,18 +3698,7 @@ void setup() {
   Serial.println("然后访问：192.168.4.1");
   Serial.println("语音控制已启用");
 
-  // 在OLED上显示WiFi信息
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(1);
-  display.setCursor(0, 14);
-  display.print("WiFi AP Started");
-  display.setCursor(0, 28);
-  display.print("Name: Desk Robot");
-  snprintf(ipBuf, sizeof(ipBuf), "IP: %s", WiFi.softAPIP().toString().c_str());
-  display.setCursor(0, 42);
-  display.print(ipBuf);
-  display.display();
+  // 启动完成, loop()接手屏幕显示
 }
 
 /* ================= 主循环 ================= */
@@ -3515,14 +3742,9 @@ void loop() {
         lastClockUpdate = millis();
         updateClockDisplay();
       }
-      // 确保WiFi模式正确
-      if (!clockModeInitialized) {
-        WiFi.mode(WIFI_AP_STA);
-        delay(200);
-        clockModeInitialized = true;
-      }
-      // 尝试连接（阻塞，最多约10秒）
+      // 尝试连接（阻塞，最多约7秒，每200ms喂狗）
       connectToRouter();
+      yield();
       if (routerConnected) {
         initSNTP();
         if (strlen(weatherApiKey) > 0 && strlen(weatherLocationId) == 0) {
@@ -3598,9 +3820,18 @@ void loop() {
 
     case CLOCK_RUNNING:
       {
-        unsigned long refInterval = needFasterRefresh ? 250 : 1000;
-        if (millis() - lastClockUpdate >= refInterval) {
+        static int lastDispMin = -1;
+        int curMin = timeinfo.tm_min;
+        bool doUpdate = false;
+        if (needFasterRefresh) {
+          if (millis() - lastClockUpdate >= 250) { doUpdate = true; }
+        } else if (curMin != lastDispMin || weatherJustUpdated) {
+          doUpdate = true;
+        }
+        if (doUpdate) {
           lastClockUpdate = millis();
+          lastDispMin = curMin;
+          weatherJustUpdated = false;
           updateClockDisplay();
         }
       }
@@ -3623,6 +3854,23 @@ void loop() {
     default:
       // CLOCK_INIT, CLOCK_SETUP, CLOCK_WIFI_FAILED
       if (millis() - lastClockUpdate >= 1000) {
+        lastClockUpdate = millis();
+        updateClockDisplay();
+      }
+      // 检测WiFi是否已通过WebUI连接成功（仅限从未连接状态过渡）
+      if (routerConnected && (clockState == CLOCK_INIT || clockState == CLOCK_WIFI_FAILED)) {
+        initSNTP();
+        clockModeInitialized = true;
+        if (strlen(weatherApiKey) > 0 && strlen(weatherLocationId) == 0) {
+          clockState = CLOCK_LOCATING;
+          Serial.println("WiFi已连接(WebUI)，进入定位状态");
+        } else if (strlen(weatherLocationId) > 0) {
+          clockState = CLOCK_FETCHING;
+          Serial.println("WiFi已连接(WebUI)，进入获取天气状态");
+        } else {
+          clockState = CLOCK_SETUP;
+          Serial.println("WiFi已连接(WebUI)，等待天气配置");
+        }
         lastClockUpdate = millis();
         updateClockDisplay();
       }
@@ -4035,6 +4283,11 @@ if (millis() - lastStatus > 5000) {
   int stations = WiFi.softAPgetStationNum();
   Serial.print("已连接设备数: ");
   Serial.println(stations);
+  static int lastStations = -1;
+  if (stations != lastStations) {
+    lastStations = stations;
+    WiFi.setTxPower(stations > 0 ? WIFI_POWER_19_5dBm : WIFI_POWER_8_5dBm);
+  }
 
   // 在OLED上更新连接状态（已禁用，避免干扰眼睛动画）
   /*
