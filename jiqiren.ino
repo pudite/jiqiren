@@ -649,9 +649,9 @@ void updateClockDisplay() {
     u8g2.sendBuffer(); return;
   }
 
-  // === 分割线: 上部51px(y=0-50), 下部12px(y=52-63), 左右x=77仅上部 ===
-  u8g2.drawHLine(0, 51, 128);
-  u8g2.drawLine(77, 0, 77, 50);
+  // === 分割线: 上部50px(y=0-49), 下部13px(y=50-63), 左右x=77仅上部 ===
+  u8g2.drawHLine(0, 50, 128);
+  u8g2.drawLine(77, 0, 77, 49);
 
   // 公用变量
   bool timeOk = getTime();
@@ -763,7 +763,7 @@ void updateClockDisplay() {
     break;
   }
 
-  // ============ 底部区 (0-127, 52-63, 12px): 明日天气居中 ============
+  // ============ 底部区 (0-127, 50-63, 14px): 明日天气居中 ============
   if (hasWeather && weatherMatch && clockState == CLOCK_RUNNING) {
     u8g2.setFont(u8g2_font_wqy12_t_gb2312);
     char tmrBuf[54];
@@ -777,10 +777,10 @@ void updateClockDisplay() {
         if (bottomScrollOff <= -(tmrW - 126 + 8)) bottomScrollDir = 1;
         if (bottomScrollOff >= 0) bottomScrollDir = -1;
       }
-      u8g2.setCursor(1 + bottomScrollOff, 63);
+      u8g2.setCursor(1 + bottomScrollOff, 62);
     } else {
       bottomScrollOff = 0; bottomScrollDir = 1;
-      u8g2.setCursor((128 - tmrW) / 2, 63);
+      u8g2.setCursor((128 - tmrW) / 2, 62);
     }
     u8g2.print(tmrBuf);
   }
