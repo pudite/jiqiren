@@ -384,7 +384,7 @@ typedef struct {
 char routerSSID[33] = "";
 char routerPassword[65] = "";
 char weatherApiKey[65] = "";
-char weatherApiHost[65] = "devapi.qweather.com";
+char weatherApiHost[65] = "";
 char weatherCity[33] = "";
 char weatherLocationId[16] = "";
 
@@ -410,7 +410,7 @@ void fetchWeatherSafe() {
   wp.host = weatherApiHost;
   wp.path = "/v7/weather/3d?location=" + String(weatherLocationId) + "&lang=zh";
   httpTaskDone = false;
-  xTaskCreate(httpFetchTask, "httpFetch", 16384, NULL, 1, NULL);
+  xTaskCreate(httpFetchTask, "httpFetch", 20480, NULL, 2, NULL);
   unsigned long fetchStart = millis();
   while (!httpTaskDone && (millis() - fetchStart < 25000)) { delay(100); }
 }
@@ -1367,6 +1367,10 @@ void fetchWeather() {
     Serial.println("天气获取跳过: API Key未设置");
     return;
   }
+  if (strlen(weatherApiHost) == 0) {
+    Serial.println("天气获取跳过: API Host未设置");
+    return;
+  }
   if (strlen(weatherLocationId) == 0) {
     Serial.println("LocationID未设置，使用默认武汉");
     strcpy(weatherLocationId, "101200101");
@@ -1475,14 +1479,10 @@ void loadConfigFromEEPROM() {
     strncpy(weatherApiHost, cfg.apiHost, sizeof(weatherApiHost) - 1);
     strncpy(weatherCity, cfg.city, sizeof(weatherCity) - 1);
     strncpy(weatherLocationId, cfg.locationId, sizeof(weatherLocationId) - 1);
-    if (strlen(weatherApiHost) == 0) {
-      strcpy(weatherApiHost, "devapi.qweather.com");
-    }
     Serial.print("从EEPROM加载配置 - WiFi: ");
     Serial.println(routerSSID);
   } else {
     Serial.println("EEPROM无配置");
-    strcpy(weatherApiHost, "devapi.qweather.com");
   }
 }
 
@@ -2389,7 +2389,7 @@ h2 {
   <h4>🌤 第二步：配置天气</h4>
   <div class="config-row">
     <label>Host</label>
-    <input type="text" id="cfg_apihost" placeholder="devapi.qweather.com" autocomplete="off">
+    <input type="text" id="cfg_apihost" placeholder="和风天气API Host" autocomplete="off">
   </div>
   <div class="config-row">
     <label>Key</label>
@@ -2598,10 +2598,11 @@ function saveWeatherConfig() {
   const apiKey = document.getElementById('cfg_apikey').value;
   const apiHost = document.getElementById('cfg_apihost').value;
   if (!apiKey) { alert('请填写和风天气API Key'); return; }
+  if (!apiHost) { alert('请填写和风天气API Host'); return; }
   const btn = document.getElementById('btnSaveApi');
   btn.textContent = '保存中...'; btn.disabled = true; btn.style.opacity = 0.5;
   fetch('/saveApiConfig?apiKey=' + encodeURIComponent(apiKey) +
-    '&apiHost=' + encodeURIComponent(apiHost || 'devapi.qweather.com'))
+    '&apiHost=' + encodeURIComponent(apiHost || ''))
     .then(r => r.text())
     .then(t => {
       alert(t);
@@ -2780,7 +2781,7 @@ function loadConfig() {
       ssidSel.value = d.ssid || '';
       document.getElementById('cfg_password').value = d.password || '';
       document.getElementById('cfg_apikey').value = d.apiKey || '';
-      document.getElementById('cfg_apihost').value = d.apiHost || 'devapi.qweather.com';
+      document.getElementById('cfg_apihost').value = d.apiHost || '';
 
       // 根据WiFi连接状态和当前模式显示/隐藏天气配置区域
       const weatherSection = document.getElementById('weatherSection');
@@ -3111,10 +3112,6 @@ void setupServer() {
     locationId.toCharArray(weatherLocationId, sizeof(weatherLocationId));
     city.toCharArray(weatherCity, sizeof(weatherCity));
 
-    if (strlen(weatherApiHost) == 0) {
-      strcpy(weatherApiHost, "devapi.qweather.com");
-    }
-
     saveConfigToEEPROM();
 
     if (wifiConfigChanged) {
@@ -3209,6 +3206,10 @@ void setupServer() {
       server.send(200, "text/plain", "错误：API Key未设置");
       return;
     }
+    if (strlen(weatherApiHost) == 0) {
+      server.send(200, "text/plain", "错误：API Host未设置");
+      return;
+    }
     if (lastWeatherOkTime > 0 && millis() - lastWeatherOkTime < 1800000
         && strcmp(lastWeatherOkLoc, weatherLocationId) == 0) {
       server.send(200, "text/plain", "请勿频繁刷新(30分钟内已更新)");
@@ -3299,8 +3300,10 @@ void setupServer() {
     apiKey.toCharArray(weatherApiKey, sizeof(weatherApiKey));
     if (apiHost.length() > 0) {
       apiHost.toCharArray(weatherApiHost, sizeof(weatherApiHost));
-    } else {
-      strcpy(weatherApiHost, "devapi.qweather.com");
+    }
+    if (strlen(weatherApiKey) == 0 || strlen(weatherApiHost) == 0) {
+      server.send(200, "text/plain", "错误：API Key和Host不能为空");
+      return;
     }
     saveConfigToEEPROM();
 
@@ -3787,7 +3790,7 @@ void loop() {
           wp.host = weatherApiHost;
           wp.path = "/v7/weather/3d?location=" + String(weatherLocationId) + "&lang=zh";
           httpTaskDone = false;
-          xTaskCreate(httpFetchTask, "httpFetch", 16384, NULL, 1, NULL);
+          xTaskCreate(httpFetchTask, "httpFetch", 20480, NULL, 2, NULL);
         }
         clockFetchStart = millis();
         clockFetchStarted = true;
@@ -3821,6 +3824,7 @@ void loop() {
     case CLOCK_RUNNING:
       {
         static int lastDispMin = -1;
+        getTime(); // 先刷新时间，否则timeinfo是旧值
         int curMin = timeinfo.tm_min;
         bool doUpdate = false;
         if (needFasterRefresh) {
@@ -3837,17 +3841,29 @@ void loop() {
       }
       // 定时刷新天气(非阻塞,后台任务)
       if (!clockFetchStarted && routerConnected && millis() - lastWeatherFetch >= 7200000) {
+        Serial.println("[天气] 定时刷新触发 (距上次" + String((millis() - lastWeatherFetch) / 60000) + "分钟)");
         wp.host = weatherApiHost;
         wp.path = "/v7/weather/3d?location=" + String(weatherLocationId) + "&lang=zh";
         httpTaskDone = false;
-        xTaskCreate(httpFetchTask, "httpFetch", 16384, NULL, 1, NULL);
-        clockFetchStart = millis();
-        clockFetchStarted = true;
-        lastWeatherFetch = millis();
+        BaseType_t ret = xTaskCreate(httpFetchTask, "httpFetch", 20480, NULL, 2, NULL);
+        if (ret != pdPASS) {
+          Serial.println("[天气] xTaskCreate失败, 5分钟后重试");
+          httpTaskDone = true;
+          lastWeatherFetch = millis() - 6900000; // 5分钟后重试(7200000-300000)
+        } else {
+          Serial.println("[天气] httpFetch任务已创建");
+          clockFetchStart = millis();
+          clockFetchStarted = true;
+          lastWeatherFetch = millis();
+        }
       }
       if (clockFetchStarted && (httpTaskDone || millis() - clockFetchStart > 30000)) {
         clockFetchStarted = false;
-        Serial.println(httpTaskDone ? "定时天气刷新完成" : "定时天气刷新超时");
+        if (httpTaskDone) {
+          Serial.println("[天气] 定时刷新完成");
+        } else {
+          Serial.println("[天气] 定时刷新超时(30s), 后台任务仍在运行");
+        }
       }
       break;
 
